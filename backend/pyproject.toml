@@ -1,0 +1,45 @@
+[project]
+name = "startup-radar-backend"
+version = "0.1.0"
+description = "FastAPI backend for startup ecosystem graph extraction and exploration"
+requires-python = ">=3.12"
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "fastapi>=0.115.6",
+  "feedparser>=6.0.11",
+  "httpx>=0.28.1",
+  "mlflow[genai]>=3.12,<4",
+  "neo4j>=5.26.0",
+  "openai>=1.58.0",
+  "prometheus-client>=0.21.1",
+  "pydantic>=2.10.4",
+  "pydantic-settings>=2.7.0",
+  "python-dotenv>=1.0.1",
+  "python-json-logger>=2.0.7",
+  "rapidfuzz>=3.11.0",
+  "tenacity>=9.0.0",
+  "uvicorn[standard]>=0.34.0",
+]
+
+[project.optional-dependencies]
+embeddings = [
+  "sentence-transformers>=3.0",
+]
+
+dev = [
+  "pytest>=8.3.4",
+  "pytest-asyncio>=0.25.0",
+  "ruff>=0.8.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+  "integration: tests that require explicitly provisioned external services",
+]
