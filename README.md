@@ -1,6 +1,6 @@
 # Startup Radar
 
-Startup Radar turns startup news into an evidence-backed knowledge graph with full LLM Observability.
+Startup Radar turns startup news into an evidence-backed knowledge graph with end-to-end LLM observability.
 
 It scrapes startup news articles ([deutsche-startups.de](https://www.deutsche-startups.de),
 a German startup news publication), extracts structured facts with an LLM,
