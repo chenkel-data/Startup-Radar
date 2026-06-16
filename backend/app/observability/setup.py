@@ -17,9 +17,12 @@ import json
 
 import mlflow
 import mlflow.openai
+import mlflow.tracing
+from mlflow.tracing.config import get_config
 
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.observability.llm_steps import label_llm_span_with_workflow_step
 
 _logger = get_logger("observability.setup")
 _enabled: bool = False
@@ -46,6 +49,7 @@ def init_mlflow(settings: Settings) -> None:
         mlflow.set_experiment(settings.mlflow_experiment_name)
         if settings.mlflow_openai_autolog:
             mlflow.openai.autolog()
+        _configure_span_processors()
         _enabled = True
         _logger.info(
             "mlflow_ready",
@@ -74,6 +78,15 @@ def init_mlflow(settings: Settings) -> None:
         )
 
 
+def _configure_span_processors() -> None:
+    processors = list(get_config().span_processors)
+    if label_llm_span_with_workflow_step in processors:
+        return
+    mlflow.tracing.configure(
+        span_processors=[*processors, label_llm_span_with_workflow_step],
+    )
+
+
 def _sync_prompts(settings: Settings) -> None:
     """Register current local prompt templates and sync the configured alias.
 
@@ -87,10 +100,22 @@ def _sync_prompts(settings: Settings) -> None:
         build_extraction_prompt_registry_template,
         build_gleaning_prompt_registry_template,
     )
+    from app.prompts.entity_curation import (
+        build_entity_curation_prompt_registry_template,
+        build_entity_profile_review_prompt_registry_template,
+    )
 
     entries = [
         (settings.mlflow_prompt_extraction_uri, build_extraction_prompt_registry_template),
         (settings.mlflow_prompt_gleaning_uri, build_gleaning_prompt_registry_template),
+        (
+            settings.mlflow_prompt_profile_review_uri,
+            build_entity_profile_review_prompt_registry_template,
+        ),
+        (
+            settings.mlflow_prompt_profile_curation_uri,
+            build_entity_curation_prompt_registry_template,
+        ),
     ]
     for uri, build_fn in entries:
         name, alias = _parse_prompt_uri(uri)

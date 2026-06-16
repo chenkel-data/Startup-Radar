@@ -37,6 +37,11 @@ class TerminalFormatter(logging.Formatter):
         ("ingestion", "resolution"): (4, 5, "Normalize entities"),
         ("resolution", "entity_resolution"): (4, 5, "Normalize entities"),
         ("ingestion", "graph_ingest"): (5, 5, "Write graph"),
+        ("curation", "entity_profile_curation"): (5, 5, "Curate profiles"),
+        ("curation", "profile_candidates"): (5, 5, "Curate profiles"),
+        ("curation", "profile_review"): (5, 5, "Review profile"),
+        ("curation", "profile_curation"): (5, 5, "Curate profile"),
+        ("curation", "profile_embedding"): (5, 5, "Update profile embedding"),
         ("schema", "apply"): (None, None, "Schema"),
         ("startup", "database"): (None, None, "Startup"),
         ("search", "fulltext"): (None, None, "Search"),
@@ -88,6 +93,19 @@ class TerminalFormatter(logging.Formatter):
         "entity_merged_embedding": "entity merged by embedding match",
         "entity_embedding_no_match": "embedding match not found",
         "entity_created": "new entity created",
+        "entity_profile_candidates_loaded": "profile curation candidates loaded",
+        "entity_profile_processing_started": "profile processing started",
+        "entity_profile_review_requested": "waiting for profile review LLM",
+        "entity_profile_review_completed": "profile review completed",
+        "entity_profile_curation_requested": "waiting for profile curation LLM",
+        "entity_profile_curation_completed": "profile curated",
+        "entity_profile_kept": "profile kept",
+        "entity_profile_flagged": "profile flagged for review",
+        "entity_profile_embedding_updated": "profile embedding updated",
+        "entity_profile_embedding_skipped": "profile embedding unchanged",
+        "entity_profile_skipped": "profile skipped",
+        "entity_profile_curation_failed": "profile curation failed",
+        "entity_profile_curation_stage_failed": "profile curation stage failed",
         "http_request": "HTTP request",
         "neo4j_connected": "Neo4j connected",
         "neo4j_unavailable": "Neo4j unavailable",
@@ -102,6 +120,10 @@ class TerminalFormatter(logging.Formatter):
         "mode",
         "model",
         "entity_type",
+        "entity_name",
+        "status",
+        "decision",
+        "confidence",
         "duration_ms",
         "count",
         "failed_count",
@@ -114,11 +136,13 @@ class TerminalFormatter(logging.Formatter):
         "detail": "detail",
         "duration_ms": "duration",
         "entity_type": "type",
+        "entity_name": "entity",
         "failed_count": "failed",
     }
     FIELD_LIMITS = {
         "article_title": 120,
         "detail": 520,
+        "entity_name": 120,
         "url": 180,
         "error": 300,
     }
@@ -183,7 +207,8 @@ def setup_logging(settings: Settings) -> None:
         formatter = jsonlogger.JsonFormatter(
             "%(asctime)s %(levelname)s %(name)s %(message)s %(event)s %(component)s "
             "%(workflow_step)s %(duration_ms)s %(count)s %(task_id)s %(url)s "
-            "%(entity_type)s %(detail)s %(article_title)s %(article_index)s "
+            "%(entity_type)s %(entity_name)s %(status)s %(decision)s %(confidence)s "
+            "%(detail)s %(article_title)s %(article_index)s "
             "%(article_total)s %(page_index)s %(page_total)s %(completed_count)s "
             "%(remaining)s %(attempt_index)s %(attempt_total)s %(retry_delay_seconds)s "
             "%(failed_count)s %(mode)s %(model)s %(error)s"

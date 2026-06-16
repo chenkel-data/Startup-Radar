@@ -331,27 +331,14 @@ class EntityResolver:
         for ckey, _ in candidate_pairs:
             exact = self._alias_index.get((entity_type, ckey))
             if exact:
-                if _entry_is_blocked(exact, blocked_entity_ids, blocked_canonical_keys):
-                    self.logger.info(
-                        "entity_merge_blocked_by_relationship",
-                        extra={
-                            "event": "resolution",
-                            "workflow_step": "entity_resolution",
-                            "entity_type": entity_type,
-                            "detail": (
-                                f'blocked merge "{entity.name}" -> '
-                                f'"{exact.entity.canonical_name}" because both entities '
-                                "appear as endpoints of an article relationship"
-                            ),
-                        },
-                    )
-                    continue
-                if await self._graph_relationship_blocks_merge(
+                if await self._relationship_blocks_merge(
                     exact,
                     entity_type=entity_type,
                     candidate_name=entity.name,
                     candidate_names=all_names,
                     method="exact",
+                    blocked_entity_ids=blocked_entity_ids,
+                    blocked_canonical_keys=blocked_canonical_keys,
                 ):
                     continue
                 self.logger.info(
@@ -380,13 +367,15 @@ class EntityResolver:
         )
 
         if best_entry and best_result.minimum >= _AUTO_MERGE_MIN_SCORE:
-            if not await self._graph_relationship_blocks_merge(
+            if not await self._relationship_blocks_merge(
                 best_entry,
                 entity_type=entity_type,
                 candidate_name=entity.name,
                 candidate_names=all_names,
                 method="fuzzy",
                 similarity=best_result.minimum,
+                blocked_entity_ids=blocked_entity_ids,
+                blocked_canonical_keys=blocked_canonical_keys,
             ):
                 self.logger.info(
                     "entity_merged_heuristic",
@@ -434,23 +423,19 @@ class EntityResolver:
             if matched_id:
                 # Look up the in-memory entry by id so we can merge into it
                 best_cos_entry = self._entry_by_id(entity_type, matched_id)
-                if best_cos_entry and _entry_is_blocked(
-                    best_cos_entry,
-                    blocked_entity_ids,
-                    blocked_canonical_keys,
-                ):
-                    best_cos_entry = None
             else:
                 best_cos_entry = None
 
             if best_cos_entry:
-                if not await self._graph_relationship_blocks_merge(
+                if not await self._relationship_blocks_merge(
                     best_cos_entry,
                     entity_type=entity_type,
                     candidate_name=entity.name,
                     candidate_names=all_names,
                     method="embedding",
                     similarity=cos_score,
+                    blocked_entity_ids=blocked_entity_ids,
+                    blocked_canonical_keys=blocked_canonical_keys,
                 ):
                     self.logger.info(
                         "entity_merged_embedding",
@@ -530,7 +515,11 @@ class EntityResolver:
         best_result = _zero
 
         for entry in self._entries_by_type[entity_type]:
-            if _entry_is_blocked(entry, blocked_entity_ids, blocked_canonical_keys):
+            if _entry_blocked_by_current_article_relationship(
+                entry,
+                blocked_entity_ids,
+                blocked_canonical_keys,
+            ):
                 continue
             entry_key_pairs = [
                 (ekey, NameNormalizer.token_set(ekey, entity_type)) for ekey in entry.keys
@@ -546,7 +535,7 @@ class EntityResolver:
 
         return best_entry, best_result
 
-    async def _graph_relationship_blocks_merge(
+    async def _relationship_blocks_merge(
         self,
         entry: RegistryEntry,
         *,
@@ -554,8 +543,33 @@ class EntityResolver:
         candidate_name: str,
         candidate_names: list[str],
         method: ResolutionMethod,
+        blocked_entity_ids: set[str],
+        blocked_canonical_keys: set[str],
         similarity: float | None = None,
     ) -> bool:
+        if _entry_blocked_by_current_article_relationship(
+            entry,
+            blocked_entity_ids,
+            blocked_canonical_keys,
+        ):
+            detail = (
+                f'blocked {method} merge "{candidate_name}" -> '
+                f'"{entry.entity.canonical_name}" because both entities '
+                "appear as endpoints of the current article relationship"
+            )
+            if similarity is not None:
+                detail += f" score={similarity:.3f}"
+            self.logger.info(
+                "entity_merge_blocked_by_current_article_relationship",
+                extra={
+                    "event": "resolution",
+                    "workflow_step": "entity_resolution",
+                    "entity_type": entity_type,
+                    "detail": detail,
+                },
+            )
+            return True
+
         if self._graph is None:
             return False
         has_relationship = getattr(
@@ -673,7 +687,7 @@ def _select_canonical(existing: str, _candidate: str) -> str:
     return existing
 
 
-def _entry_is_blocked(
+def _entry_blocked_by_current_article_relationship(
     entry: RegistryEntry,
     blocked_entity_ids: set[str],
     blocked_canonical_keys: set[str],

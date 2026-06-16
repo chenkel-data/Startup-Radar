@@ -1,13 +1,15 @@
+from types import SimpleNamespace
+
 import pytest
 
 from app.models.extraction import (
-    ArticleIn,
     ExtractedEntity,
     ExtractedRelationship,
     ExtractionResult,
-    IngestStats,
+    NormalizedEntity,
 )
-from app.services.ingestion import IngestionService, _ArticleResult, _evidence_status_counts
+from app.services.entity_resolution import ResolutionOutcome
+from app.services.ingestion import IngestionService
 
 
 def test_evidence_gate_keeps_only_admitted_entities_and_relationships() -> None:
@@ -80,100 +82,59 @@ def test_ensure_relationship_entities_materializes_admitted_missing_endpoints() 
     assert all("Speculative" not in startup.name for startup in extraction.startups)
 
 
-def test_evidence_status_counts_include_defaulted_records() -> None:
-    extraction = ExtractionResult(
-        startups=[
-            ExtractedEntity(
-                name="Defaulted Startup",
-                evidence_status="unsure",
-                evidence_status_defaulted=True,
-            )
-        ],
-        relationships=[
-            ExtractedRelationship(
-                type="INVESTED_IN",
-                source_name="Investor",
-                source_type="Investor",
-                target_name="Defaulted Startup",
-                target_type="Startup",
-                evidence_status="unsure",
-                evidence_status_defaulted=True,
-            )
-        ],
-    )
+class FakeProfileCuration:
+    def __init__(self) -> None:
+        self.entity_ids: list[list[str]] = []
 
-    counts = _evidence_status_counts(extraction)
+    async def curate_entity_ids(self, entity_ids, *, job_run_id=None):
+        self.entity_ids.append(list(entity_ids))
+        return [
+            {
+                "entity_id": entity_ids[0],
+                "status": "kept",
+                "job_run_id": job_run_id,
+            }
+        ]
 
-    assert counts["entity_unsure"] == 1
-    assert counts["entity_status_defaulted"] == 1
-    assert counts["relationship_unsure"] == 1
-    assert counts["relationship_status_defaulted"] == 1
+    async def curate_profiles(self, *_args, **_kwargs):
+        raise AssertionError("graph-wide curation should not be used during ingestion")
 
 
-def test_tally_accumulates_processed_and_failed_article_results() -> None:
-    success = _ArticleResult()
-    success.success = True
-    success.graph_row = {"entity_count": 4, "graph_operations": 9}
-    failure = _ArticleResult()
-    failure.success = False
-    stats = IngestionService._tally
+class FakeLogger:
+    def info(self, *_args, **_kwargs) -> None:
+        return None
 
-    ingest_stats = IngestStats(source_name="deutsche-startups.de")
-    stats(object.__new__(IngestionService), [success, failure], ingest_stats)
-
-    assert ingest_stats.articles_processed == 1
-    assert ingest_stats.articles_failed == 1
-    assert ingest_stats.entities_extracted == 4
-    assert ingest_stats.relationships_created == 9
+    def warning(self, *_args, **_kwargs) -> None:
+        return None
 
 
 @pytest.mark.asyncio
-async def test_dispatch_articles_processes_each_article_with_batch_context() -> None:
-    class FakeIngestionService:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str, int, int]] = []
-
-        async def _process_article(
-            self,
-            *,
-            article: ArticleIn,
-            resolver: object,
-            job_run_id: str,
-            article_index: int,
-            article_total: int,
-        ) -> _ArticleResult:
-            assert resolver is fake_resolver
-            self.calls.append((article.url, job_run_id, article_index, article_total))
-            result = _ArticleResult()
-            result.success = True
-            return result
-
-    articles = [
-        ArticleIn(
-            url="https://example.test/one",
-            title="Article one",
-            source_name="deutsche-startups.de",
-            text="Article one has enough text for the ingestion model validator.",
-        ),
-        ArticleIn(
-            url="https://example.test/two",
-            title="Article two",
-            source_name="deutsche-startups.de",
-            text="Article two has enough text for the ingestion model validator.",
-        ),
-    ]
-    fake_resolver = object()
-    service = FakeIngestionService()
-
-    results = await IngestionService._dispatch_articles(
-        service,  # type: ignore[arg-type]
-        articles=articles,
-        resolver=fake_resolver,  # type: ignore[arg-type]
-        job_run_id="job-123",
+async def test_curates_only_resolved_entity_ids_after_article_write() -> None:
+    service = object.__new__(IngestionService)
+    profile_curation = FakeProfileCuration()
+    service.settings = SimpleNamespace(enable_entity_description_curation=True)
+    service.profile_curation = profile_curation
+    service.logger = FakeLogger()
+    sap = NormalizedEntity(
+        id="company:sap",
+        label="Company",
+        canonical_name="SAP",
+        name="SAP",
     )
 
-    assert [result.success for result in results] == [True, True]
-    assert service.calls == [
-        ("https://example.test/one", "job-123", 1, 2),
-        ("https://example.test/two", "job-123", 2, 2),
+    rows = await service._curate_resolved_entities_traced(
+        [
+            ResolutionOutcome(entity=sap, method="exact", candidate_name="SAP"),
+            ResolutionOutcome(entity=sap, method="fuzzy", candidate_name="SAP SE"),
+        ],
+        job_run_id="job-1",
+    )
+
+    assert profile_curation.entity_ids == [["company:sap"]]
+    assert rows == [
+        {
+            "entity_id": "company:sap",
+            "status": "kept",
+            "job_run_id": "job-1",
+        }
     ]
