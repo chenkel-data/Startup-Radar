@@ -11,7 +11,13 @@ type Props = {
   task?: TaskStatus;
 };
 
-export function IngestControl({ maxPages, onMaxPagesChange, onRun, onClear, task }: Props) {
+export function IngestControl({
+  maxPages,
+  onMaxPagesChange,
+  onRun,
+  onClear,
+  task,
+}: Props) {
   const running = task?.status === "queued" || task?.status === "running";
   const processed = task?.result?.articles_processed as number | undefined;
   const found = task?.result?.articles_found as number | undefined;
@@ -136,5 +142,3 @@ export function IngestControl({ maxPages, onMaxPagesChange, onRun, onClear, task
     </section>
   );
 }
-
-

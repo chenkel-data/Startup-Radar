@@ -8,6 +8,7 @@ import { SearchPanel } from "./components/SearchPanel";
 import { DetailsPanel } from "./components/DetailsPanel";
 import { ApiError, api } from "./lib/api";
 import type {
+  EntityCounts,
   GraphNode,
   GraphResponse,
   SearchResult,
@@ -16,6 +17,13 @@ import type {
 
 const ENTITY_TYPES = ["Startup", "Investor", "Company", "Person", "Topic", "Article", "Source"];
 const FOCUSABLE_NODE_TYPES = new Set(["Startup", "Investor", "Company", "Person", "Topic"]);
+const HEADER_ENTITY_COUNTS: Array<{ key: keyof EntityCounts; label: string }> = [
+  { key: "Startup", label: "Startups" },
+  { key: "Investor", label: "Investors" },
+  { key: "Company", label: "Companies" },
+  { key: "Person", label: "People" },
+  { key: "Topic", label: "Topics" },
+];
 const RELATION_TYPES = [
   "INVESTED_IN",
   "FOUNDED_BY",
@@ -42,6 +50,21 @@ export default function App() {
   const [task, setTask] = useState<TaskStatus | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [refreshKey, setRefreshKey] = useState(0);
+  const [entityCounts, setEntityCounts] = useState<EntityCounts>({
+    Startup: 0,
+    Investor: 0,
+    Company: 0,
+    Person: 0,
+    Topic: 0,
+  });
+
+  const loadEntityCounts = useCallback(async () => {
+    try {
+      setEntityCounts(await api.entityCounts());
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Entity count request failed");
+    }
+  }, []);
 
   const loadGraph = useCallback(async (entity?: string) => {
     setGraphLoading(true);
@@ -55,12 +78,13 @@ export default function App() {
         setSelectedNode(undefined);
       }
       setRefreshKey((value) => value + 1);
+      void loadEntityCounts();
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Graph request failed");
     } finally {
       setGraphLoading(false);
     }
-  }, []);
+  }, [loadEntityCounts]);
 
   useEffect(() => {
     void loadGraph();
@@ -107,6 +131,10 @@ export default function App() {
     [loadGraph],
   );
 
+  const resetFullGraph = useCallback(() => {
+    void loadGraph();
+  }, [loadGraph]);
+
   async function runSearch(query: string) {
     setSearchLoading(true);
     setError(undefined);
@@ -138,34 +166,16 @@ export default function App() {
     try {
       const result = await api.clearGraph();
       setGraph({ nodes: [], edges: [] });
+      setEntityCounts({ Startup: 0, Investor: 0, Company: 0, Person: 0, Topic: 0 });
       setSelectedNode(undefined);
       setResults([]);
+      setRefreshKey((value) => value + 1);
       return result;
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Clear failed");
       throw exc;
     }
   }
-
-  const graphSummary = useMemo(() => {
-    const startupCount = graph.nodes.filter((node) => node.type === "Startup").length;
-    const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
-    const investorIds = new Set(
-      graph.nodes.filter((node) => node.type === "Investor").map((node) => node.id),
-    );
-    for (const edge of graph.edges) {
-      const source = nodeById.get(edge.source);
-      if (
-        edge.label === "INVESTED_IN" &&
-        source &&
-        ["Company", "Person"].includes(source.type)
-      ) {
-        investorIds.add(source.id);
-      }
-    }
-    const investorCount = investorIds.size;
-    return { startupCount, investorCount };
-  }, [graph.edges, graph.nodes]);
 
   const typeCounts = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -202,14 +212,14 @@ export default function App() {
           </p>
         </div>
 
-        <div className="hero-metrics">
-          <div className="stat-chip">
-            <span className="stat-label">Startups</span>
-            <strong className="stat-value">{graphSummary.startupCount}</strong>
-          </div>
-          <div className="stat-chip">
-            <span className="stat-label">Investors</span>
-            <strong className="stat-value">{graphSummary.investorCount}</strong>
+        <div className="hero-metrics" aria-label="Entity counts">
+          <div className="entity-counts">
+            {HEADER_ENTITY_COUNTS.map((item) => (
+              <span className="entity-count" key={item.key}>
+                <span>{item.label}</span>
+                <strong>{formatCount(entityCounts[item.key])}</strong>
+              </span>
+            ))}
           </div>
           <button className="icon-button subtle" onClick={() => void loadGraph()} aria-label="Refresh graph">
             <RefreshCcw size={18} className={graphLoading ? "spin" : ""} />
@@ -266,6 +276,7 @@ export default function App() {
           visibleRelations={visibleRelations}
           selectedNode={selectedNode}
           onNodeSelect={selectNode}
+          onFullGraphReset={resetFullGraph}
         />
 
         <DetailsPanel
@@ -329,4 +340,8 @@ function valueAsStringArray(value: unknown): string[] {
   return value
     .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
     .filter((entry) => entry.length > 0);
+}
+
+function formatCount(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
 }

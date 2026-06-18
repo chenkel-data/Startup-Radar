@@ -13,6 +13,7 @@ const apiMock = vi.hoisted(() => ({
   startIngest: vi.fn(),
   ingestStatus: vi.fn(),
   clearGraph: vi.fn(),
+  entityCounts: vi.fn(),
   insights: vi.fn(),
 }));
 
@@ -122,6 +123,13 @@ describe("App graph exploration", () => {
     vi.mocked(api.search).mockResolvedValue([searchResult]);
     vi.mocked(api.nodeClaims).mockResolvedValue({ node_id: "", claims: [], mentions: [] });
     vi.mocked(api.clearGraph).mockResolvedValue({ status: "ok", deleted_nodes: 0 });
+    vi.mocked(api.entityCounts).mockResolvedValue({
+      Startup: 0,
+      Investor: 0,
+      Company: 0,
+      Person: 0,
+      Topic: 0,
+    });
   });
 
   it("searches an entity and focuses the returned subgraph", async () => {

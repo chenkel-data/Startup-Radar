@@ -18,7 +18,7 @@ import { api } from "../lib/api";
 import { stringValue } from "../lib/helpers";
 import type {
   ClaimAssertion,
-  ClaimReviewEvent,
+  ClaimSourceArticle,
   GraphEdge,
   GraphNode,
   GraphResponse,
@@ -56,6 +56,16 @@ type TraceReference = {
   relationship: string;
   trace_id?: string;
   mlflow_url?: string;
+};
+
+type ProfileTraceReference = {
+  status?: string;
+  decision?: string;
+  confidence?: string;
+  traceId?: string;
+  experimentId?: string;
+  traceUrl?: string;
+  tracedAt?: string;
 };
 
 const DISPLAY_KEYS = [
@@ -101,6 +111,25 @@ type ClaimFilter = "review" | "supported" | "reviewed" | "all";
 
 const INITIAL_VISIBLE_CLAIMS = 6;
 const CLAIM_VISIBLE_STEP = 6;
+
+type ClaimHistoryModel = {
+  articles: ClaimSourceArticle[];
+  currentCount: number;
+  totalCount: number;
+};
+
+type EntityExtractionReference = {
+  edgeId: string;
+  relationship: string;
+  articleId?: string;
+  articleTitle: string;
+  articleUrl?: string;
+  processedAt?: string;
+  publishedAt?: string;
+  evidence?: string;
+  traceUrl?: string;
+  assertion: ClaimAssertion;
+};
 
 export function DetailsPanel({
   node,
@@ -242,6 +271,7 @@ export function DetailsPanel({
   const rawExtractionCount = rawExtraction ? countRawExtraction(rawExtraction) : 0;
   const articleText = node?.type === "Article" ? stringValue(node.properties.text) : undefined;
   const traceRefs = useMemo(() => buildArticleTraceReferences(node), [node]);
+  const profileTrace = useMemo(() => buildProfileTraceReference(node), [node]);
 
   const summary =
     node &&
@@ -300,6 +330,10 @@ export function DetailsPanel({
                   <span key={alias}>{alias}</span>
                 ))}
               </div>
+            )}
+
+            {node.type !== "Article" && profileTrace && (
+              <ProfileStatusRow profileTrace={profileTrace} />
             )}
           </section>
 
@@ -394,15 +428,17 @@ export function DetailsPanel({
               )}
             </section>
           ) : (
-            <ClaimsSection
-              claims={claimData?.claims ?? []}
-              mentions={claimData?.mentions ?? []}
-              nodeLabel={node.label}
-              loading={claimLoading}
-              error={claimError}
-              reviewingEdgeId={reviewingEdgeId}
-              onReview={(claim, decision) => void reviewClaim(claim, decision)}
-            />
+            <>
+              <EntityExtractionSection mentions={claimData?.mentions ?? []} loading={claimLoading} />
+              <ClaimsSection
+                claims={claimData?.claims ?? []}
+                nodeLabel={node.label}
+                loading={claimLoading}
+                error={claimError}
+                reviewingEdgeId={reviewingEdgeId}
+                onReview={(claim, decision) => void reviewClaim(claim, decision)}
+              />
+            </>
           )}
 
           <section className="kpi-grid">
@@ -501,9 +537,189 @@ export function DetailsPanel({
   );
 }
 
+function ProfileStatusRow({ profileTrace }: { profileTrace: ProfileTraceReference }) {
+  const hasWarning =
+    profileTrace.status === "needs_human_review" ||
+    profileTrace.decision === "possible_wrong_merge" ||
+    profileTrace.decision === "conflicting_evidence";
+  const StatusIcon = hasWarning ? AlertTriangle : CheckCircle2;
+  const summary = profileCurationSummary(profileTrace);
+  const tracedAt = profileTrace.tracedAt ? `Profile checked ${formatDateTime(profileTrace.tracedAt)}` : undefined;
+  return (
+    <div className={`profile-status-row ${hasWarning ? "warning" : ""}`}>
+      <div className="profile-status-copy">
+        <div className="profile-status-title">
+          <StatusIcon size={14} />
+          <small>Entity description</small>
+        </div>
+        <strong>{summary}</strong>
+        {tracedAt && <span>{tracedAt}</span>}
+      </div>
+
+      <div className="profile-status-actions">
+        {profileTrace.traceUrl ? (
+          <a
+            className="claim-trace-link"
+            href={profileTrace.traceUrl}
+            target="_blank"
+            rel="noreferrer"
+            title={profileTrace.traceUrl}
+          >
+            <ExternalLink size={13} />
+            <span>View curation trace</span>
+          </a>
+        ) : (
+          <small>Trace unavailable</small>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EntityExtractionSection({
+  mentions,
+  loading,
+}: {
+  mentions: NodeClaim[];
+  loading: boolean;
+}) {
+  const [showHistory, setShowHistory] = useState(false);
+  const references = useMemo(() => buildEntityExtractionReferences(mentions), [mentions]);
+  const latest = references[0];
+  const historyReferences = references.slice(1, 4);
+  const hasHistory = historyReferences.length > 0;
+  const sourceArticleCount = countEntityExtractionArticles(references);
+
+  useEffect(() => {
+    setShowHistory(false);
+  }, [mentions]);
+
+  return (
+    <section className="intel-section extraction-section">
+      <div className="section-head extraction-section-head">
+        <div className="extraction-icon" aria-hidden="true">
+          <FileText size={15} />
+        </div>
+        <div className="extraction-title-copy">
+          <h4>{extractionSectionTitle(sourceArticleCount)}</h4>
+        </div>
+        {references.length > 0 && (
+          hasHistory ? (
+            <button
+              className="extraction-count-button"
+              type="button"
+              aria-expanded={showHistory}
+              onClick={() => setShowHistory((current) => !current)}
+            >
+              {sourceArticleCountLabel(sourceArticleCount)}
+              {showHistory ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            </button>
+          ) : (
+            <span className="extraction-count-label">{sourceArticleCountLabel(sourceArticleCount)}</span>
+          )
+        )}
+      </div>
+
+      {loading && references.length === 0 && (
+        <p className="empty-text">Loading extraction provenance...</p>
+      )}
+
+      {!loading && !latest && (
+        <p className="empty-text">No article extraction trace for this node.</p>
+      )}
+
+      {latest && <EntityExtractionTraceRow reference={latest} variant="latest" />}
+      {showHistory && hasHistory && (
+        <div className="extraction-history-list" aria-label="Previous article extraction traces">
+          {historyReferences.map((reference, index) => (
+            <EntityExtractionTraceRow
+              key={entityExtractionReferenceKey(reference, index)}
+              reference={reference}
+              variant="history"
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function EntityExtractionTraceRow({
+  reference,
+  variant = "history",
+}: {
+  reference: EntityExtractionReference;
+  variant?: "latest" | "history";
+}) {
+  const meta = [
+    reference.processedAt ? `Article extracted ${formatExtractionDateTime(reference.processedAt)}` : undefined,
+    reference.publishedAt ? `Published ${formatDate(reference.publishedAt)}` : undefined,
+  ].filter(Boolean);
+  const content = (
+    <>
+      <span className="trace-meta">
+        <strong>{reference.articleTitle}</strong>
+        <small>{meta.join(" | ")}</small>
+      </span>
+      {reference.traceUrl ? (
+        <span className="trace-action">
+          <span>Open trace</span>
+          <ExternalLink size={13} />
+        </span>
+      ) : (
+        <span className="trace-missing">No MLflow log</span>
+      )}
+    </>
+  );
+
+  if (reference.traceUrl) {
+    return (
+      <a
+        className={`trace-row extraction-trace-row ${variant}`}
+        href={reference.traceUrl}
+        target="_blank"
+        rel="noreferrer"
+      >
+        {content}
+      </a>
+    );
+  }
+
+  return <div className={`trace-row extraction-trace-row ${variant} muted`}>{content}</div>;
+}
+
+function profileCurationSummary(event: Pick<ProfileTraceReference, "status" | "decision" | "confidence">): string {
+  const { status, decision } = event;
+  if (decision === "exact_duplicate_evidence" || status === "skipped_exact_duplicate_evidence") {
+    return "New evidence already matched the current description, so review was skipped.";
+  }
+  if (decision === "insufficient_evidence") {
+    return "Review found the new evidence was insufficient to update the description.";
+  }
+  if (decision === "possible_wrong_merge") {
+    return "Review found the new evidence may describe a different entity.";
+  }
+  if (decision === "conflicting_evidence") {
+    return "Review found the new evidence conflicts with the current description.";
+  }
+  if (decision === "update_profile" || status === "curated" || status === "updated") {
+    return "Review found the description should be updated, and curation updated it.";
+  }
+  if (decision === "keep_profile" || status === "reviewed_keep" || status === "kept") {
+    return "Review found the current description should stay unchanged.";
+  }
+  if (
+    status === "needs_human_review" ||
+    decision === "needs_human_review"
+  ) {
+    return "Review could not safely decide how to update the description.";
+  }
+  if (status === "embedding_refreshed") return "Description search data was refreshed.";
+  return "Description checked.";
+}
+
 function ClaimsSection({
   claims,
-  mentions,
   nodeLabel,
   loading,
   error,
@@ -511,7 +727,6 @@ function ClaimsSection({
   onReview,
 }: {
   claims: NodeClaim[];
-  mentions: NodeClaim[];
   nodeLabel: string;
   loading: boolean;
   error?: string;
@@ -521,7 +736,6 @@ function ClaimsSection({
   const counts = useMemo(() => claimCounts(claims), [claims]);
   const [activeFilter, setActiveFilter] = useState<ClaimFilter>("review");
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_CLAIMS);
-  const [expandedClaimId, setExpandedClaimId] = useState<string | undefined>();
 
   useEffect(() => {
     if (claims.length === 0) return;
@@ -532,7 +746,6 @@ function ClaimsSection({
 
   useEffect(() => {
     setVisibleCount(INITIAL_VISIBLE_CLAIMS);
-    setExpandedClaimId(undefined);
   }, [activeFilter, claims.length]);
 
   const filteredClaims = useMemo(() => {
@@ -615,13 +828,7 @@ function ClaimsSection({
                   key={claim.edge_id}
                   claim={claim}
                   nodeLabel={nodeLabel}
-                  expanded={expandedClaimId === claim.edge_id}
                   reviewing={reviewingEdgeId === claim.edge_id}
-                  onToggle={() =>
-                    setExpandedClaimId((current) =>
-                      current === claim.edge_id ? undefined : claim.edge_id,
-                    )
-                  }
                   onReview={onReview}
                 />
               ))}
@@ -641,19 +848,6 @@ function ClaimsSection({
         </>
       )}
 
-      {mentions.length > 0 && (
-        <details className="article-expand context-claims">
-          <summary>Mentioned in articles ({mentions.length})</summary>
-          <div className="mention-list">
-            {mentions.map((mention) => (
-              <div className="mention-row" key={mention.edge_id}>
-                <strong>{mention.counterparty.label}</strong>
-                <small>{mention.relationship}</small>
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
     </section>
   );
 }
@@ -661,96 +855,77 @@ function ClaimsSection({
 function ClaimCard({
   claim,
   nodeLabel,
-  expanded,
   reviewing,
-  onToggle,
   onReview,
 }: {
   claim: NodeClaim;
   nodeLabel: string;
-  expanded: boolean;
   reviewing: boolean;
-  onToggle: () => void;
   onReview: (claim: NodeClaim, decision: "accepted" | "rejected" | "unreviewed") => void;
 }) {
   const status = claimStatus(claim);
-  const supportLabel =
-    claim.active_support_count === 1
-      ? "1 active supporting article"
-      : `${claim.active_support_count} active supporting articles`;
+  const history = useMemo(() => buildClaimHistory(claim), [claim]);
+  const primaryArticle = primaryHistoryArticle(history);
   const primary = primaryAssertion(claim);
-  const reason = reviewReasonSummary(claim);
-  const evidence = primary?.evidence;
-  const articleTitle = articleDisplayTitle(primary?.article_title || primary?.article_url);
-  const run = primary ? runLabel(primary) : undefined;
+  const evidence = primaryArticle?.evidence ?? primary?.evidence;
+  const evidenceLabel = "Evidence";
+  const articleTitle =
+    articleDisplayTitle(primaryArticle?.article_title || primaryArticle?.article_url) ??
+    articleDisplayTitle(primary?.article_title || primary?.article_url);
+  const traceUrl = primaryArticle?.trace_url ?? (primary ? traceUrlForAssertion(primary) : undefined);
   const direction = claimDirectionView(claim, nodeLabel);
   const DirectionArrow = direction.undirected ? ArrowRightLeft : ArrowRight;
-  const latestReview = latestReviewEvent(claim);
   const canAccept = claim.review_status !== "accepted";
   const canReject = claim.review_status !== "rejected";
   const canReset = claim.review_status === "accepted" || claim.review_status === "rejected";
+  const supportLabel = claimSupportLabel(claim, history.currentCount);
+  const sourceIntro = claimSourceIntro(claim);
   return (
-    <article className={`claim-card ${status.className} ${expanded ? "expanded" : ""}`}>
-      <button
-        className="claim-row-button"
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-      >
-        {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-        <span className="claim-row-copy">
-          <span className="claim-row-head">
-            <span className="claim-row-kicker">Extracted relationship</span>
+    <article className={`claim-card ${status.className}`}>
+      <div className="claim-card-body">
+        <div className="claim-card-top">
+          <span className="claim-card-status-line">
             <span className="claim-status">
               {status.icon === "warning" ? <AlertTriangle size={12} /> : <CheckCircle2 size={12} />}
               {status.label}
             </span>
           </span>
-          <span className="claim-graph-line" title={claimDirectionTitle(direction, claim.relationship)}>
-            <span className={`claim-node ${direction.source.isSelected ? "selected" : ""}`}>
-              {direction.source.label}
-            </span>
-            <DirectionArrow className="claim-arrow-icon" size={14} aria-hidden="true" />
-            <span className="claim-relation-code">{claim.relationship}</span>
-            <DirectionArrow className="claim-arrow-icon" size={14} aria-hidden="true" />
-            <span className={`claim-node ${direction.target.isSelected ? "selected" : ""}`}>
-              {direction.target.label}
-            </span>
-          </span>
-          {reason && (
-            <span className="claim-summary-line claim-row-reason">
-              <b>Reason for review:</b> {reason}
+          {supportLabel && (
+            <span className={`claim-support ${history.currentCount === 0 ? "empty" : "active"}`}>
+              {supportLabel}
             </span>
           )}
-          {evidence && (
-            <span className="claim-summary-line claim-row-evidence">
-              <b>Evidence:</b> {evidence}
-            </span>
-          )}
-          {latestReview && (
-            <span className="claim-summary-line claim-row-review">
-              <b>Human feedback:</b> {reviewEventSummary(latestReview)}
-            </span>
-          )}
-          <span className="claim-row-meta">
-            <span>
-              <b>Article:</b> {articleTitle ? `"${articleTitle}"` : "No title stored"}
-            </span>
-            <span>
-              <b>Run:</b> {run ?? "No ingestion date stored"}
-            </span>
-            <span>
-              <b>Support:</b> {supportLabel}
-            </span>
-          </span>
-        </span>
-      </button>
+        </div>
 
-      {expanded && (
-        <div className="claim-detail">
+        <div className="claim-graph-line" title={claimDirectionTitle(direction, claim.relationship)}>
+          <span className={`claim-node ${direction.source.isSelected ? "selected" : ""}`}>
+            {direction.source.label}
+          </span>
+          <span className="claim-relation-code">{claim.relationship}</span>
+          <DirectionArrow className="claim-arrow-icon" size={14} aria-hidden="true" />
+          <span className={`claim-node ${direction.target.isSelected ? "selected" : ""}`}>
+            {direction.target.label}
+          </span>
+        </div>
+
+        {articleTitle && (
+          <p className="claim-source-sentence">
+            <span>{sourceIntro}</span>
+            <strong>{articleTitle}</strong>
+          </p>
+        )}
+
+        {evidence && (
+          <blockquote className="claim-evidence">
+            <span>{evidenceLabel}</span>
+            <q>{evidence}</q>
+          </blockquote>
+        )}
+
+        <div className="claim-footer">
           <div className="claim-actions">
-            {primary && traceUrlForAssertion(primary) && (
-              <a className="claim-trace-link" href={traceUrlForAssertion(primary)} target="_blank" rel="noreferrer">
+            {traceUrl && (
+              <a className="claim-trace-link" href={traceUrl} target="_blank" rel="noreferrer">
                 <ExternalLink size={13} />
                 <span>Open trace</span>
               </a>
@@ -779,96 +954,42 @@ function ClaimCard({
               </button>
             )}
           </div>
-
-          {claim.review_history && claim.review_history.length > 0 && (
-            <ReviewHistory events={claim.review_history} />
-          )}
-
-          {claim.assertions.length > 0 && (
-            <details className="claim-history-panel" open>
-              <summary className="claim-history-head">
-                <strong>History</strong>
-                <span>{claim.assertions.length} events</span>
-              </summary>
-              <ol className="claim-timeline">
-                {claim.assertions.map((assertion, index) => (
-                  <ClaimAssertionRow
-                    key={`${assertion.trace_id ?? assertion.article_url ?? "assertion"}-${index}`}
-                    assertion={assertion}
-                  />
-                ))}
-              </ol>
-            </details>
-          )}
         </div>
-      )}
+      </div>
     </article>
   );
 }
 
-function ReviewHistory({ events }: { events: ClaimReviewEvent[] }) {
-  const ordered = [...events].reverse();
-  return (
-    <section className="review-history">
-      <strong>Human feedback</strong>
-      <div className="review-history-list">
-        {ordered.map((event, index) => (
-          <div key={`${event.reviewed_at ?? "review"}-${index}`} className="review-history-row">
-            <span>{reviewEventSummary(event)}</span>
-            {event.comment && <small>{event.comment}</small>}
-          </div>
-        ))}
-      </div>
-    </section>
-  );
+function claimSupportLabel(claim: NodeClaim, currentCount: number): string | undefined {
+  if (claim.review_status === "needs_review" && currentCount === 0) return undefined;
+  if (currentCount === 0) return "No active source";
+  if (currentCount === 1) return "1 source";
+  return `${currentCount} sources`;
 }
 
-function ClaimAssertionRow({ assertion }: { assertion: ClaimAssertion }) {
-  const title = articleDisplayTitle(assertion.article_title || assertion.article_url) || "Untitled article";
-  const processedAt = assertion.processed_at ? formatDateTime(assertion.processed_at) : undefined;
-  const publishedAt = assertion.published_at ? formatDate(assertion.published_at) : undefined;
-  const traceUrl = traceUrlForAssertion(assertion);
-  return (
-    <li className={`assertion-row ${assertionEventClass(assertion)}`}>
-      <span className="assertion-marker" aria-hidden="true" />
-      <div className="assertion-main">
-        <div className="assertion-line">
-          <strong>{assertionEventLabel(assertion)}</strong>
-          {processedAt && <span>Run: {processedAt}</span>}
-        </div>
-        <p className="assertion-article" title={assertion.article_title || assertion.article_url}>
-          <b>Article:</b> "{title}"
-        </p>
-        {publishedAt && <p className="assertion-submeta">Published: {publishedAt}</p>}
-        {assertion.evidence && (
-          <p className="assertion-evidence">
-            <b>Evidence:</b> {assertion.evidence}
-          </p>
-        )}
-        <div className="assertion-foot">
-          {assertion.job_run_id && <span>Run ID: {assertion.job_run_id.slice(0, 8)}</span>}
-          {traceUrl && (
-            <a href={traceUrl} target="_blank" rel="noreferrer">
-              Open trace
-              <ExternalLink size={12} />
-            </a>
-          )}
-        </div>
-      </div>
-    </li>
-  );
+function claimSourceIntro(claim: NodeClaim): string {
+  if (claim.review_status === "needs_review") {
+    return "Review source";
+  }
+  if (claim.review_status === "accepted" || claim.review_status === "rejected") return "Reviewed source";
+  return "Source";
 }
 
-function assertionEventLabel(assertion: ClaimAssertion): string {
-  if (assertion.event === "not_reproduced") return "Not reproduced";
-  if (assertion.event === "direction_changed") return "Direction changed";
-  return "Asserted";
+function claimHeadline(claim: NodeClaim): string {
+  if (claim.review_status === "needs_review") {
+    return reviewReasonHeadline(claim.review_reasons[0]);
+  }
+  if (claim.review_status === "accepted") return "Accepted";
+  if (claim.review_status === "rejected") return "Rejected";
+  return "Supported";
 }
 
-function assertionEventClass(assertion: ClaimAssertion): string {
-  if (assertion.event === "not_reproduced") return "omitted";
-  if (assertion.event === "direction_changed") return "changed";
-  return "asserted";
+function reviewReasonHeadline(reason?: string): string {
+  if (reason === "not_reproduced_same_article") return "Missing in latest extraction";
+  if (reason === "direction_changed_same_article") return "Direction changed";
+  if (reason === "inverse_direction") return "Conflicting direction";
+  if (reason === "competing_transaction_type") return "Competing claim";
+  return "Needs review";
 }
 
 function claimStatus(claim: NodeClaim): {
@@ -877,16 +998,13 @@ function claimStatus(claim: NodeClaim): {
   icon: "warning" | "ok";
 } {
   if (claim.review_status === "needs_review") {
-    return { label: "Review required", className: "needs-review", icon: "warning" };
+    return { label: claimHeadline(claim), className: "needs-review", icon: "warning" };
   }
   if (claim.review_status === "rejected") {
     return { label: "Rejected", className: "rejected", icon: "warning" };
   }
   if (claim.review_status === "accepted") {
     return { label: "Accepted", className: "accepted", icon: "ok" };
-  }
-  if (claim.support_changed) {
-    return { label: "Support changed", className: "support-changed", icon: "warning" };
   }
   return { label: "Supported", className: "supported", icon: "ok" };
 }
@@ -928,7 +1046,7 @@ function claimOverviewLabel(counts: {
 }
 
 function isReviewClaim(claim: NodeClaim): boolean {
-  return claim.review_status === "needs_review" || claim.support_changed;
+  return claim.review_status === "needs_review";
 }
 
 function isSupportedClaim(claim: NodeClaim): boolean {
@@ -948,10 +1066,9 @@ function compareClaims(left: NodeClaim, right: NodeClaim): number {
 
 function claimRank(claim: NodeClaim): number {
   if (claim.review_status === "needs_review") return 0;
-  if (claim.support_changed) return 1;
-  if (claim.review_status === "unreviewed") return 2;
-  if (claim.review_status === "accepted") return 3;
-  if (claim.review_status === "rejected") return 4;
+  if (claim.review_status === "unreviewed") return 1;
+  if (claim.review_status === "accepted") return 2;
+  if (claim.review_status === "rejected") return 3;
   return 5;
 }
 
@@ -993,79 +1110,158 @@ function claimSortLabel(claim: NodeClaim): string {
   return `${claim.relationship}:${claim.direction}:${claim.counterparty.label}`;
 }
 
-function primaryAssertion(claim: NodeClaim): ClaimAssertion | undefined {
+function primaryHistoryArticle(history: ClaimHistoryModel): ClaimSourceArticle | undefined {
   return (
-    claim.assertions.find((assertion) => assertion.event === "asserted" && assertion.evidence) ??
-    claim.assertions.find((assertion) => assertion.event === "asserted") ??
-    claim.assertions[0]
+    history.articles.find((article) => article.review_source) ??
+    history.articles.find((article) => article.status === "current" && article.evidence) ??
+    history.articles.find((article) => article.status === "current") ??
+    history.articles[0]
   );
 }
 
-function latestReviewEvent(claim: NodeClaim): ClaimReviewEvent | undefined {
-  const history = claim.review_history ?? [];
-  if (history.length > 0) return history[history.length - 1];
-  if (claim.review_status === "accepted" || claim.review_status === "rejected") {
-    return {
-      decision: claim.review_status,
-      comment: claim.review_comment,
-      reviewer: claim.reviewed_by,
-      reviewed_at: claim.reviewed_at,
-    };
-  }
-  return undefined;
+function primaryAssertion(claim: NodeClaim): ClaimAssertion | undefined {
+  const sortedAssertions = [...claim.assertions].sort(compareAssertionsByTime);
+  return (
+    sortedAssertions.find((assertion) => assertion.event === "asserted" && assertion.evidence) ??
+    sortedAssertions.find((assertion) => assertion.event === "asserted") ??
+    sortedAssertions[0]
+  );
 }
 
-function reviewEventSummary(event: ClaimReviewEvent): string {
-  const decision = reviewDecisionLabel(event.decision);
-  const reviewer = event.reviewer ? ` by ${event.reviewer}` : "";
-  const reviewedAt = event.reviewed_at ? ` on ${formatDateTime(event.reviewed_at)}` : "";
-  return `${decision}${reviewer}${reviewedAt}`;
+function buildEntityExtractionReferences(mentions: NodeClaim[]): EntityExtractionReference[] {
+  return mentions
+    .flatMap((mention) =>
+      mention.assertions
+        .filter((assertion) => assertion.event === "asserted")
+        .map((assertion) => ({
+          edgeId: mention.edge_id,
+          relationship: mention.relationship,
+          articleId: assertion.article_id,
+          articleTitle:
+            articleDisplayTitle(assertion.article_title) ??
+            articleDisplayTitle(mention.counterparty.label) ??
+            articleDisplayTitle(assertion.article_url) ??
+            "Untitled article",
+          articleUrl: assertion.article_url,
+          processedAt: assertion.processed_at,
+          publishedAt: assertion.published_at,
+          evidence: assertion.evidence,
+          traceUrl: traceUrlForAssertion(assertion),
+          assertion,
+        })),
+    )
+    .sort((left, right) => assertionTimeValue(right.assertion) - assertionTimeValue(left.assertion));
 }
 
-function reviewDecisionLabel(decision?: string): string {
-  if (decision === "accepted") return "Accepted";
-  if (decision === "rejected") return "Rejected";
-  if (decision === "unreviewed") return "Reset to unreviewed";
-  return "Reviewed";
+function sourceArticleCountLabel(count: number): string {
+  return count === 1 ? "1 source article" : `${count} source articles`;
+}
+
+function extractionSectionTitle(count: number): string {
+  return count === 1 ? "Latest Article Extraction" : "Latest Article Extractions";
+}
+
+function countEntityExtractionArticles(references: EntityExtractionReference[]): number {
+  const articleKeys = new Set(references.map(entityExtractionArticleKey));
+  return articleKeys.size;
+}
+
+function entityExtractionArticleKey(reference: EntityExtractionReference): string {
+  return (
+    reference.articleId ??
+    reference.articleUrl ??
+    `${reference.articleTitle}:${reference.publishedAt ?? ""}`
+  );
+}
+
+function entityExtractionReferenceKey(reference: EntityExtractionReference, index: number): string {
+  return [
+    reference.edgeId,
+    reference.articleId,
+    reference.traceUrl,
+    reference.articleUrl,
+    reference.articleTitle,
+    reference.processedAt ?? reference.publishedAt,
+    index,
+  ]
+    .filter(Boolean)
+    .join(":");
+}
+
+function buildClaimHistory(claim: NodeClaim): ClaimHistoryModel {
+  const articles = Array.isArray(claim.source_articles)
+    ? [...claim.source_articles].sort(compareSourceArticles)
+    : [];
+  return {
+    articles,
+    currentCount:
+      articles.length > 0
+        ? articles.filter((article) => article.status === "current").length
+        : claim.active_support_count,
+    totalCount: articles.length,
+  };
+}
+
+function compareSourceArticles(left: ClaimSourceArticle, right: ClaimSourceArticle): number {
+  const leftRank = sourceArticleRank(left);
+  const rightRank = sourceArticleRank(right);
+  if (leftRank !== rightRank) return leftRank - rightRank;
+  return sourceArticleTimeValue(right) - sourceArticleTimeValue(left);
+}
+
+function sourceArticleRank(article: ClaimSourceArticle): number {
+  if (article.review_source) return 0;
+  if (article.status === "current") return 1;
+  if (article.status === "no_longer_current" || article.status === "direction_changed") return 2;
+  return 3;
+}
+
+function sourceArticleTimeValue(article: ClaimSourceArticle): number {
+  const timestamp = article.latest_processed_at || article.published_at || "";
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareAssertionsByTime(left: ClaimAssertion, right: ClaimAssertion): number {
+  return assertionTimeValue(right) - assertionTimeValue(left);
+}
+
+function assertionTimeValue(assertion: ClaimAssertion): number {
+  const timestamp = assertion.processed_at || assertion.published_at || "";
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function traceUrlForAssertion(assertion: ClaimAssertion): string | undefined {
   return assertion.mlflow_trace_url ?? fallbackMlflowTraceUrl(assertion.trace_id, assertion.mlflow_experiment_id);
 }
 
-function runLabel(assertion: ClaimAssertion): string | undefined {
-  const timestamp = assertion.processed_at || assertion.published_at;
-  return timestamp ? formatDateTime(timestamp) : undefined;
+function buildProfileTraceReference(node?: GraphNode): ProfileTraceReference | undefined {
+  if (!node || node.type === "Article") return undefined;
+  const status = stringValue(node.properties.description_curation_status);
+  const decision = stringValue(node.properties.description_review_decision);
+  const traceId = stringValue(node.properties.description_trace_id);
+  const experimentId = stringValue(node.properties.description_mlflow_experiment_id);
+  const traceUrl = stringValue(node.properties.description_trace_url) ?? fallbackMlflowTraceUrl(traceId, experimentId);
+  const tracedAt = stringValue(node.properties.description_traced_at);
+  const hasCurationSignal = Boolean(status || decision || traceId || traceUrl || tracedAt);
+  if (!hasCurationSignal) return undefined;
+  const profileTrace: ProfileTraceReference = {
+    status,
+    decision,
+    confidence: stringValue(node.properties.description_confidence),
+    traceId,
+    experimentId,
+    traceUrl,
+    tracedAt,
+  };
+  return Object.values(profileTrace).some((value) => Boolean(value)) ? profileTrace : undefined;
 }
 
 function articleDisplayTitle(value?: string): string | undefined {
   const title = value?.replace(/\s+/g, " ").trim();
   if (!title) return undefined;
   return title;
-}
-
-function reviewReasonSummary(claim: NodeClaim): string | undefined {
-  if (claim.review_reasons.length > 0) {
-    return claim.review_reasons.map(reviewReasonLabel).join(" | ");
-  }
-  if (claim.support_changed) {
-    return "Supporting evidence changed since this relationship was last processed";
-  }
-  return undefined;
-}
-
-function reviewReasonLabel(reason: string): string {
-  if (reason === "not_reproduced_same_article") {
-    return "Not reproduced when its source article was processed again";
-  }
-  if (reason === "direction_changed_same_article") {
-    return "Direction changed when its source article was processed again";
-  }
-  if (reason === "inverse_direction") return "Conflicting direction between the same entities";
-  if (reason === "competing_transaction_type") {
-    return "Another article describes this pair using a competing transaction type";
-  }
-  return reason.replace(/_/g, " ");
 }
 
 function TraceRow({ trace }: { trace: TraceReference }) {
@@ -1375,6 +1571,19 @@ function formatDateTime(value: string): string {
     minute: "2-digit",
     second: "2-digit",
     timeZoneName: "short",
+  }).format(new Date(time));
+}
+
+function formatExtractionDateTime(value: string): string {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return value;
+  return new Intl.DateTimeFormat("en-GB", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
   }).format(new Date(time));
 }
 
