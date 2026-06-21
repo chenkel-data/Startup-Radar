@@ -408,7 +408,9 @@ describe("DetailsPanel claim review behavior", () => {
       "href",
       "http://localhost:5001/#/experiments/2/traces/tr-latest",
     );
-    expect(within(traceLink).getByText(/Article extracted 01 Jun 2026, 12:00:00 \| Published/i)).toBeInTheDocument();
+    expect(traceLink).toHaveTextContent(
+      /Article extracted 01 Jun 2026, \d{2}:00:00 \| Published 16 May 2026/i,
+    );
     expect(within(traceLink).queryByText(/CEST|MENTIONS/i)).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /5 source articles/i }));
