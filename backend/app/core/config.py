@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = Field(default=45, alias="LLM_TIMEOUT_SECONDS", ge=5)
     llm_retry_attempts: int = Field(default=3, alias="LLM_RETRY_ATTEMPTS", ge=1, le=8)
     llm_gleaning_passes: int = Field(default=1, alias="LLM_GLEANING_PASSES", ge=0, le=3)
+    enable_entity_description_curation: bool = Field(
+        default=False, alias="ENABLE_ENTITY_DESCRIPTION_CURATION"
+    )
+    entity_curation_max_concurrency: int = Field(
+        default=2, alias="ENTITY_CURATION_MAX_CONCURRENCY", ge=1, le=10
+    )
     embedding_provider: Literal["openai", "sentence-transformers"] = Field(
         default="openai", alias="EMBEDDING_PROVIDER"
     )
@@ -60,6 +66,14 @@ class Settings(BaseSettings):
     mlflow_prompt_gleaning_uri: str = Field(
         default="prompts:/article_extraction_gleaning@champion",
         alias="MLFLOW_PROMPT_GLEANING_URI",
+    )
+    mlflow_prompt_profile_review_uri: str = Field(
+        default="prompts:/entity_profile_review@champion",
+        alias="MLFLOW_PROMPT_PROFILE_REVIEW_URI",
+    )
+    mlflow_prompt_profile_curation_uri: str = Field(
+        default="prompts:/entity_profile_curation@champion",
+        alias="MLFLOW_PROMPT_PROFILE_CURATION_URI",
     )
     mlflow_use_prompt_registry: bool = Field(
         default=True,

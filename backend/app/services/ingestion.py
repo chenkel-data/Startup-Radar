@@ -8,7 +8,7 @@ Pipeline shape
 3. Each article then flows through `_process_article`, decorated with
    `@mlflow.trace`. That is the trace **root** for the article, and the
    tree below it captures the whole pipeline (extract → filter → resolve
-   → write).
+   → write → curate touched entity profiles).
 4. Per-article OpenAI calls auto-instrument as `CHAT_MODEL` spans
    thanks to `mlflow.openai.autolog()`.
 
@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 from time import perf_counter
 from typing import Any
-from urllib.parse import quote
 
 import mlflow
 from mlflow.entities import SpanType
@@ -47,13 +46,17 @@ from app.models.extraction import (
 )
 from app.observability import IngestionRun, RunHandle
 from app.observability.context import current_trace_id as _current_trace_id
+from app.observability.costs import aggregate_llm_costs_for_job, llm_cost_metrics
 from app.observability.artifacts import (
     build_dedup_report,
     build_ingestion_summary_md,
 )
 from app.observability.scorers import attach_extraction_scores
-from app.graph.graph_store import GraphStore
+from app.observability.traces import mlflow_trace_link
+from app.graph.article_graph_writer import ArticleGraphWriter
+from app.graph.entity_resolution_store import EntityResolutionStore
 from app.services.embedding import EmbeddingService
+from app.services.entity_curation import EntityProfileCurationService
 from app.services.entity_resolution import EntityResolver, NameNormalizer, ResolutionOutcome
 from app.services.llm import LLMExtractionService, MISSING_OPENAI_API_KEY_MESSAGE
 from app.services.progress import article_fields
@@ -73,6 +76,7 @@ class _ArticleResult:
         "graph_row",
         "outcome_rows",
         "extraction_dump",
+        "curation_rows",
         "failure_row",
         "input_tokens",
         "output_tokens",
@@ -86,6 +90,7 @@ class _ArticleResult:
         self.graph_row: dict[str, Any] = {}
         self.outcome_rows: list[dict[str, Any]] = []
         self.extraction_dump: dict[str, Any] | None = None
+        self.curation_rows: list[dict[str, Any]] = []
         self.failure_row: dict[str, Any] | None = None
         self.input_tokens: int = 0
         self.output_tokens: int = 0
@@ -99,14 +104,18 @@ class IngestionService:
         settings: Settings,
         scraper: ArticleScraper,
         llm: LLMExtractionService,
-        graph: GraphStore,
+        article_writer: ArticleGraphWriter,
+        resolution_store: EntityResolutionStore,
         embedding: EmbeddingService | None = None,
+        profile_curation: EntityProfileCurationService | None = None,
     ):
         self.settings = settings
         self.scraper = scraper
         self.llm = llm
-        self.graph = graph
+        self.article_writer = article_writer
+        self.resolution_store = resolution_store
         self.embedding = embedding
+        self.profile_curation = profile_curation
         self.logger = get_logger("ingestion")
         # Resolver state and Neo4j writes are not thread-safe; serialize the
         # post-extraction phase per ingestion. Extraction itself still runs
@@ -198,8 +207,14 @@ class IngestionService:
             "llm_retry_attempts": self.settings.llm_retry_attempts,
             "llm_max_concurrency": self.settings.llm_max_concurrency,
             "llm_gleaning_passes": self.settings.llm_gleaning_passes,
+            "enable_entity_description_curation": (
+                self.settings.enable_entity_description_curation
+            ),
+            "entity_curation_max_concurrency": self.settings.entity_curation_max_concurrency,
             "prompt_extraction_uri": self.settings.mlflow_prompt_extraction_uri,
             "prompt_gleaning_uri": self.settings.mlflow_prompt_gleaning_uri,
+            "prompt_profile_review_uri": self.settings.mlflow_prompt_profile_review_uri,
+            "prompt_profile_curation_uri": (self.settings.mlflow_prompt_profile_curation_uri),
             "use_prompt_registry": self.settings.mlflow_use_prompt_registry,
             "app_env": self.settings.app_env,
             "git_sha": self.settings.git_sha,
@@ -264,8 +279,8 @@ class IngestionService:
                 "detail": "loading existing graph entities and aliases",
             },
         )
-        resolver = EntityResolver(self.settings, self.embedding, self.graph)
-        await resolver.load_from_graph(self.graph)
+        resolver = EntityResolver(self.settings, self.embedding, self.resolution_store)
+        await resolver.load_from_graph(self.resolution_store)
         duration_ms = round((perf_counter() - stage_started) * 1000, 2)
         registry_size = self._registry_size(resolver)
         ingest_run.record_metric("registry_load_duration_ms", duration_ms)
@@ -328,6 +343,9 @@ class IngestionService:
         failure_rows: list[dict[str, Any]] = []
         graph_rows: list[dict[str, Any]] = []
         extraction_dumps: list[dict[str, Any]] = []
+        curation_rows: list[dict[str, Any]] = []
+        fallback_input_tokens = 0
+        fallback_output_tokens = 0
 
         for result in results:
             if result.success:
@@ -340,12 +358,27 @@ class IngestionService:
                 graph_rows.append(result.graph_row)
                 if result.extraction_dump:
                     extraction_dumps.append(result.extraction_dump)
-                ingest_run.add_token_usage(
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                )
+                curation_rows.extend(result.curation_rows)
+                fallback_input_tokens += result.input_tokens
+                fallback_output_tokens += result.output_tokens
             elif result.failure_row:
                 failure_rows.append(result.failure_row)
+
+        llm_cost_rows = aggregate_llm_costs_for_job(
+            settings=self.settings,
+            job_run_id=ingest_run.job_run_id,
+        )
+        if llm_cost_rows:
+            ingest_run.add_token_usage(
+                input_tokens=sum(int(row.get("input_tokens") or 0) for row in llm_cost_rows),
+                output_tokens=sum(int(row.get("output_tokens") or 0) for row in llm_cost_rows),
+                cost_usd=sum(float(row.get("total_cost_usd") or 0.0) for row in llm_cost_rows),
+            )
+        elif fallback_input_tokens or fallback_output_tokens:
+            ingest_run.add_token_usage(
+                input_tokens=fallback_input_tokens,
+                output_tokens=fallback_output_tokens,
+            )
 
         attempts_list = [
             int(row.get("attempts") or 0) for row in extraction_rows if row.get("attempts")
@@ -403,6 +436,44 @@ class IngestionService:
                 / total_outcomes,
                 4,
             )
+        if curation_rows:
+            metrics["entity_profiles_reviewed"] = float(
+                sum(
+                    1
+                    for row in curation_rows
+                    if row.get("status") in {"kept", "updated", "needs_human_review"}
+                )
+            )
+            metrics["entity_profiles_kept"] = float(
+                sum(1 for row in curation_rows if row.get("status") == "kept")
+            )
+            metrics["entity_profiles_curated"] = float(
+                sum(1 for row in curation_rows if row.get("status") == "updated")
+            )
+            metrics["entity_profiles_failed"] = float(
+                sum(1 for row in curation_rows if row.get("status") == "failed")
+            )
+            metrics["entity_profiles_needing_human_review"] = float(
+                sum(1 for row in curation_rows if row.get("status") == "needs_human_review")
+            )
+            metrics["entity_profile_embeddings_updated"] = float(
+                sum(1 for row in curation_rows if row.get("embedding_updated"))
+            )
+        if llm_cost_rows:
+            cost_metrics = llm_cost_metrics(llm_cost_rows)
+            metrics.update(cost_metrics)
+            if "llm_cost_usd" in cost_metrics:
+                metrics["llm_total_cost_usd"] = cost_metrics["llm_cost_usd"]
+            if stats.articles_processed:
+                metrics["llm_cost_per_article_usd"] = round(
+                    cost_metrics.get("llm_cost_usd", 0.0) / stats.articles_processed,
+                    6,
+                )
+            if stats.entities_extracted:
+                metrics["llm_cost_per_entity_usd"] = round(
+                    cost_metrics.get("llm_cost_usd", 0.0) / stats.entities_extracted,
+                    6,
+                )
         ingest_run.record_metrics(metrics)
 
         if extraction_rows:
@@ -418,6 +489,13 @@ class IngestionService:
                 "dedup_report.json",
                 build_dedup_report(outcome_rows=outcome_rows),
             )
+        if curation_rows:
+            ingest_run.add_jsonl_artifact(
+                "entity_description_curation.jsonl",
+                curation_rows,
+            )
+        if llm_cost_rows:
+            ingest_run.add_jsonl_artifact("llm_costs.jsonl", llm_cost_rows)
 
         ingest_run.add_artifact(
             "ingestion_summary.md",
@@ -544,6 +622,10 @@ class IngestionService:
                     raw_extracted=raw_snapshot,
                     job_run_id=job_run_id,
                 )
+                curation_rows = await self._curate_resolved_entities_traced(
+                    outcomes,
+                    job_run_id=job_run_id,
+                )
         except Exception as exc:
             duration_ms = round((perf_counter() - stage_started) * 1000, 2)
             result.duration_ms = duration_ms
@@ -584,6 +666,7 @@ class IngestionService:
 
         result.success = True
         result.duration_ms = duration_ms
+        result.curation_rows = curation_rows
         result.input_tokens = int(extraction_metadata.get("input_tokens") or 0)
         result.output_tokens = int(extraction_metadata.get("output_tokens") or 0)
         result.extract_row = {
@@ -600,6 +683,9 @@ class IngestionService:
             "prompt_name": extraction_metadata.get("prompt_name"),
             "prompt_version": extraction_metadata.get("prompt_version"),
             "prompt_uri": extraction_metadata.get("prompt_uri"),
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "total_tokens": result.input_tokens + result.output_tokens,
         }
         result.graph_row = {
             "article_url": article.url,
@@ -614,6 +700,7 @@ class IngestionService:
             "resolved_embedding": method_counts["embedding"],
             "resolved_new": method_counts["new"],
             "graph_operations": graph_ops,
+            "entity_profile_curation_rows": len(curation_rows),
             "trace_id": _current_trace_id(),
         }
         result.outcome_rows = [
@@ -634,6 +721,7 @@ class IngestionService:
             "evidence_status_counts": raw_status_counts,
             "outcomes": [outcome.to_dict() for outcome in outcomes],
             "graph_operations": graph_ops,
+            "entity_profile_curation": curation_rows,
         }
 
         if span is not None:
@@ -644,6 +732,7 @@ class IngestionService:
                         "entities_extracted": cleaned.entity_count(),
                         "entities_resolved": len(outcomes),
                         "graph_operations": graph_ops,
+                        "entity_profile_curation_rows": len(curation_rows),
                         "resolution_methods": method_counts,
                         "duration_ms": duration_ms,
                     }
@@ -918,6 +1007,94 @@ class IngestionService:
                 pass
             return outcome
 
+    async def _curate_resolved_entities_traced(
+        self,
+        outcomes: list[ResolutionOutcome],
+        *,
+        job_run_id: str,
+    ) -> list[dict[str, Any]]:
+        if not self.settings.enable_entity_description_curation or self.profile_curation is None:
+            return []
+
+        entity_ids = sorted({outcome.entity.id for outcome in outcomes if outcome.entity.id})
+        if not entity_ids:
+            return []
+
+        stage_started = perf_counter()
+        with mlflow.start_span(
+            name="curate_resolved_entity_profiles",
+            span_type=SpanType.CHAIN,
+        ) as span:
+            try:
+                span.set_inputs(
+                    {
+                        "job_run_id": job_run_id,
+                        "entity_ids": entity_ids,
+                        "entity_count": len(entity_ids),
+                    }
+                )
+            except Exception:  # pragma: no cover
+                pass
+
+            self.logger.info(
+                "workflow_stage_started",
+                extra={
+                    "event": "curation",
+                    "workflow_step": "entity_profile_curation",
+                    "count": len(entity_ids),
+                    "detail": "reviewing resolved entity profile candidates",
+                },
+            )
+            try:
+                rows = await self.profile_curation.curate_entity_ids(
+                    entity_ids,
+                    job_run_id=job_run_id,
+                )
+            except Exception as exc:
+                rows = [
+                    {
+                        "status": "failed",
+                        "stage": "entity_profile_curation",
+                        "entity_ids": entity_ids,
+                        "error": str(exc)[:300],
+                    }
+                ]
+                self.logger.warning(
+                    "entity_profile_curation_stage_failed",
+                    extra={
+                        "event": "curation",
+                        "workflow_step": "entity_profile_curation",
+                        "error": str(exc),
+                    },
+                )
+
+            duration_ms = round((perf_counter() - stage_started) * 1000, 2)
+            try:
+                span.set_outputs(
+                    {
+                        "status": "succeeded"
+                        if not any(row.get("status") == "failed" for row in rows)
+                        else "failed",
+                        "duration_ms": duration_ms,
+                        "profile_curation_rows": len(rows),
+                    }
+                )
+                span.set_attribute("entity_profile_curation_duration_ms", duration_ms)
+                span.set_attribute("entity_profile_curation_rows", len(rows))
+            except Exception:  # pragma: no cover
+                pass
+            self.logger.info(
+                "workflow_stage_completed",
+                extra={
+                    "event": "curation",
+                    "workflow_step": "entity_profile_curation",
+                    "duration_ms": duration_ms,
+                    "count": len(rows),
+                    "detail": f"profile_curation_rows={len(rows)}",
+                },
+            )
+            return rows
+
     async def _write_traced(
         self,
         *,
@@ -932,7 +1109,7 @@ class IngestionService:
         # capture can't JSON-serialize. We set explicit inputs/outputs.
         with mlflow.start_span(name="write_to_neo4j", span_type=SpanType.TOOL) as span:
             trace_id = _current_trace_id()
-            mlflow_trace_url, mlflow_experiment_id = _mlflow_trace_link(self.settings, trace_id)
+            mlflow_trace_url, mlflow_experiment_id = mlflow_trace_link(self.settings, trace_id)
             try:
                 span.set_inputs(
                     {
@@ -949,7 +1126,7 @@ class IngestionService:
                 )
             except Exception:  # pragma: no cover
                 pass
-            operations = await self.graph.ingest_article_bundle(
+            operations = await self.article_writer.ingest_article_bundle(
                 article,
                 extraction,
                 resolved,
@@ -1136,27 +1313,6 @@ def _relationship_neighbor_keys(
 def _entity_key(entity_type: EntityType, name: str) -> tuple[EntityType, str] | None:
     key = NameNormalizer.key(name, entity_type)
     return (entity_type, key) if key else None
-
-
-def _mlflow_trace_link(settings: Settings, trace_id: str | None) -> tuple[str | None, str | None]:
-    if not trace_id:
-        return None, None
-    experiment_id = _mlflow_experiment_id(settings)
-    if not experiment_id:
-        return None, None
-    base_url = (settings.mlflow_public_url or settings.mlflow_tracking_uri).rstrip("/")
-    return (
-        f"{base_url}/#/experiments/{quote(experiment_id, safe='')}/traces/{quote(trace_id, safe='')}",
-        experiment_id,
-    )
-
-
-def _mlflow_experiment_id(settings: Settings) -> str | None:
-    try:
-        experiment = mlflow.get_experiment_by_name(settings.mlflow_experiment_name)
-    except Exception:  # pragma: no cover - depends on the configured MLflow service
-        return None
-    return str(experiment.experiment_id) if experiment else None
 
 
 def _percentile(values: list[float], pct: float) -> float:

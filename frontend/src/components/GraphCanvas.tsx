@@ -14,6 +14,7 @@ type Props = {
   visibleRelations: Set<string>;
   selectedNode?: GraphNode;
   onNodeSelect: (node: GraphNode | undefined) => void;
+  onFullGraphReset: () => void;
 };
 
 type VizNode = GraphNode & {
@@ -32,7 +33,7 @@ type VizNode = GraphNode & {
 type VizLink = GraphEdge & {
   color: string;
   emphasis: number;
-  marker?: "review" | "changed";
+  marker?: "review";
 };
 
 type ReframeScope = "all" | "visible" | "active-neighborhood";
@@ -81,6 +82,7 @@ export function GraphCanvas({
   visibleRelations,
   selectedNode,
   onNodeSelect,
+  onFullGraphReset,
 }: Props) {
   const frameRef = useRef<HTMLDivElement | null>(null);
   const forceRef = useRef<ForceGraphMethods<VizNode, VizLink> | undefined>(undefined);
@@ -345,7 +347,7 @@ export function GraphCanvas({
     if (!pendingBackgroundResetRef.current || selectedNode) return;
     pendingBackgroundResetRef.current = false;
     queueGraphReframe("all", ALL_GRAPH_FIT_PADDING);
-  }, [queueGraphReframe, selectedNode, visibleGraph.links.length, visibleGraph.nodes.length]);
+  }, [queueGraphReframe, selectedNode, visibleGraph.links.length, visibleGraph.nodes, visibleGraph.nodes.length]);
 
   function reframe() {
     if (selectedNode) {
@@ -366,14 +368,10 @@ export function GraphCanvas({
     if (isRecentNodeClick || hoverNodeIdRef.current) return;
 
     event.preventDefault();
+    hoverNodeIdRef.current = undefined;
     setHoverNodeId(undefined);
     pendingBackgroundResetRef.current = true;
-    onNodeSelect(undefined);
-
-    if (!selectedNode) {
-      pendingBackgroundResetRef.current = false;
-      queueGraphReframe("all", ALL_GRAPH_FIT_PADDING);
-    }
+    onFullGraphReset();
   }
 
   return (
@@ -516,8 +514,6 @@ export function GraphCanvas({
               const reviewText =
                 link.marker === "review"
                   ? " | Review required"
-                  : link.marker === "changed"
-                  ? " | Support changed"
                   : "";
               return `${sourceLabel} -> ${targetLabel} | ${link.label}${statusText}${reviewText}`;
             }}
@@ -540,7 +536,7 @@ export function GraphCanvas({
                 context.moveTo(source.x, source.y);
                 context.lineTo(target.x, target.y);
                 context.strokeStyle = "#d97706";
-                context.lineWidth = (link.marker === "review" ? 2.4 : 1.8) / globalScale;
+                context.lineWidth = 2.4 / globalScale;
                 context.setLineDash([6 / globalScale, 4 / globalScale]);
                 context.stroke();
                 context.restore();
@@ -860,9 +856,9 @@ function linkStrength(label: string): number {
   return 0.14;
 }
 
-function linkMarker(edge: GraphEdge): "review" | "changed" | undefined {
+function linkMarker(edge: GraphEdge): "review" | undefined {
   if (stringValue(edge.properties.review_status) === "needs_review") return "review";
-  return edge.properties.support_changed === true ? "changed" : undefined;
+  return undefined;
 }
 
 function endpointToId(value: unknown): string {

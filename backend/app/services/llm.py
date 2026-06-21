@@ -38,6 +38,12 @@ from app.models.extraction import (
     RawRelationshipRecord,
     SourceAttribution,
 )
+from app.observability.context import current_trace_id as _current_trace_id
+from app.observability.llm_steps import (
+    LLM_STEP_EXTRACTION,
+    LLM_STEP_GLEANING,
+    llm_workflow_step,
+)
 from app.prompts.extraction import (
     ARTICLE_TEXT_CHAR_LIMIT,
     COMPLETION_DELIMITER,
@@ -52,7 +58,6 @@ from app.services.extraction_utils import (
     _normalize_entity_type,
     _normalize_keywords,
 )
-from app.observability.context import current_trace_id as _current_trace_id
 from app.services.progress import (
     article_fields,
     extraction_summary,
@@ -128,6 +133,13 @@ class LLMExtractionService:
         if cached_prompt is None:
             return None
         try:
+            prompt_variables = set(getattr(cached_prompt, "variables", set()) or set())
+            missing_variables = set(variables) - prompt_variables
+            if missing_variables:
+                raise ValueError(
+                    "Prompt registry template does not declare variables: "
+                    + ", ".join(sorted(missing_variables))
+                )
             messages = cached_prompt.format(**variables)
             system_prompt, user_prompt = _messages_to_system_user(messages)
             _link_prompt_to_current_trace(cached_prompt)
@@ -341,7 +353,8 @@ class LLMExtractionService:
             messages=messages,
             timeout=self.settings.llm_timeout_seconds,
         )
-        return response.choices[0].message.content or "", _openai_usage(response)
+        usage = _openai_usage(response)
+        return response.choices[0].message.content or "", usage
 
     async def extract_with_gleaning(
         self,
@@ -355,7 +368,8 @@ class LLMExtractionService:
         passes = max_gleaning if max_gleaning is not None else self.settings.llm_gleaning_passes
         system_prompt, user_prompt, _ = self._render_extraction_prompts(article)
 
-        raw_content = await self._call_llm_raw(system_prompt, user_prompt)
+        with llm_workflow_step(LLM_STEP_EXTRACTION):
+            raw_content = await self._call_llm_raw(system_prompt, user_prompt)
         result = parse_extraction_output(raw_content)
         history: list[dict[str, str]] = [
             {"role": "user", "content": user_prompt},
@@ -364,7 +378,12 @@ class LLMExtractionService:
 
         for pass_index in range(1, passes + 1):
             gleaning_prompt, _ = self._render_gleaning_prompt()
-            continuation = await self._call_llm_raw(system_prompt, gleaning_prompt, history=history)
+            with llm_workflow_step(LLM_STEP_GLEANING):
+                continuation = await self._call_llm_raw(
+                    system_prompt,
+                    gleaning_prompt,
+                    history=history,
+                )
             extra = parse_extraction_output(continuation)
             _merge_gleaning_pass(
                 result,
@@ -436,16 +455,17 @@ class LLMExtractionService:
         """
         if self._client is None:
             raise RuntimeError(MISSING_OPENAI_API_KEY_MESSAGE)
-        response = await self._client.chat.completions.create(
-            model=self.settings.openai_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            timeout=self.settings.llm_timeout_seconds,
-        )
+        with llm_workflow_step(LLM_STEP_EXTRACTION):
+            response = await self._client.chat.completions.create(
+                model=self.settings.openai_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                timeout=self.settings.llm_timeout_seconds,
+            )
+            usage = _openai_usage(response)
         content = response.choices[0].message.content or ""
-        usage = _openai_usage(response)
         raw = parse_extraction_output(content)
         raw_texts = [content]
         audit = _initial_extraction_audit(raw, configured_passes=self.settings.llm_gleaning_passes)
@@ -557,11 +577,12 @@ class LLMExtractionService:
                 except Exception:  # pragma: no cover
                     pass
 
-                continuation, pass_usage = await self._call_llm_raw_with_usage(
-                    system_prompt,
-                    gleaning_prompt,
-                    history=history,
-                )
+                with llm_workflow_step(LLM_STEP_GLEANING):
+                    continuation, pass_usage = await self._call_llm_raw_with_usage(
+                        system_prompt,
+                        gleaning_prompt,
+                        history=history,
+                    )
                 raw_texts.append(continuation)
                 usage_total = _combine_usage(usage_total, pass_usage)
                 extra = parse_extraction_output(continuation)
@@ -658,7 +679,22 @@ def _openai_usage(response: Any) -> dict[str, int] | None:
         "input_tokens": int(prompt or 0),
         "output_tokens": int(completion or 0),
         "total_tokens": int(total or 0),
+        **_openai_cache_usage(usage),
     }
+
+
+def _openai_cache_usage(usage: Any) -> dict[str, int]:
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    cached = _usage_detail(prompt_details, "cached_tokens")
+    return {"cache_read_input_tokens": cached} if cached else {}
+
+
+def _usage_detail(value: Any, key: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        return int(value.get(key) or 0)
+    return int(getattr(value, key, 0) or 0)
 
 
 def _combine_usage(
@@ -667,17 +703,21 @@ def _combine_usage(
 ) -> dict[str, int] | None:
     if not left and not right:
         return None
-    merged = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-    }
+    merged = {key: 0 for key in _usage_keys(left, right)}
     for usage in (left, right):
         if not usage:
             continue
         for key in merged:
             merged[key] += int(usage.get(key, 0) or 0)
     return merged
+
+
+def _usage_keys(*usages: dict[str, int] | None) -> list[str]:
+    keys = {"input_tokens", "output_tokens", "total_tokens"}
+    for usage in usages:
+        if usage:
+            keys.update(usage)
+    return sorted(keys)
 
 
 def _initial_extraction_audit(

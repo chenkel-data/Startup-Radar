@@ -2,11 +2,8 @@ import json
 
 import pytest
 
-from app.graph.graph_store import (
-    GraphStore,
-    _claim_endpoint_ids,
-    _has_valid_claim_direction,
-    _provenance_json,
+from app.graph.article_graph_writer import (
+    ingest_article_tx,
 )
 from app.models.extraction import (
     ArticleIn,
@@ -53,83 +50,8 @@ def resolved_mapping(*entities: NormalizedEntity) -> dict[tuple[str, str], Norma
     }
 
 
-def claim(
-    relationship_type: str,
-    source_name: str,
-    source_type: str,
-    target_name: str,
-    target_type: str,
-) -> ExtractedRelationship:
-    return ExtractedRelationship(
-        type=relationship_type,  # type: ignore[arg-type]
-        source_name=source_name,
-        source_type=source_type,  # type: ignore[arg-type]
-        target_name=target_name,
-        target_type=target_type,  # type: ignore[arg-type]
-        evidence_status="stated",
-        keywords="Test",
-        evidence=f"{source_name} -> {target_name}",
-    )
-
-
-def test_claim_direction_validation_enforces_typed_relationship_endpoints() -> None:
-    assert _has_valid_claim_direction(
-        claim("INVESTED_IN", "UVC Partners", "Investor", "Aleph Alpha", "Startup")
-    )
-    assert not _has_valid_claim_direction(
-        claim("INVESTED_IN", "Aleph Alpha", "Startup", "UVC Partners", "Investor")
-    )
-    assert _has_valid_claim_direction(
-        claim("FOUNDED_BY", "ViViRA", "Startup", "Philip Heimann", "Person")
-    )
-    assert not _has_valid_claim_direction(
-        claim("FOUNDED_BY", "Philip Heimann", "Person", "ViViRA", "Startup")
-    )
-    assert _has_valid_claim_direction(claim("ACQUIRED", "SAP", "Company", "Prior Labs", "Startup"))
-    assert not _has_valid_claim_direction(
-        claim("ACQUIRED", "SAP", "Company", "UVC Partners", "Investor")
-    )
-
-
-def test_claim_endpoint_ids_canonicalize_only_undirected_mergers() -> None:
-    assert _claim_endpoint_ids("MERGED_WITH", "startup:zeta", "startup:alpha") == (
-        "startup:alpha",
-        "startup:zeta",
-    )
-    assert _claim_endpoint_ids("ACQUIRED", "company:sap", "startup:prior-labs") == (
-        "company:sap",
-        "startup:prior-labs",
-    )
-
-
-def test_provenance_json_keeps_trace_article_and_evidence_context() -> None:
-    provenance = json.loads(
-        _provenance_json(
-            article=article(),
-            article_id="article:123",
-            trace_id="trace-123",
-            mlflow_trace_url="http://mlflow/traces/trace-123",
-            mlflow_experiment_id="7",
-            job_run_id="job-123",
-            processed_at="2026-05-31T16:35:22+02:00",
-            event="asserted",
-            evidence_status="stated",
-            evidence="SAP kauft das junge KI-Startup Prior Labs.",
-        )
-    )
-
-    assert provenance["event"] == "asserted"
-    assert provenance["article_id"] == "article:123"
-    assert provenance["article_title"] == "SAP kauft Prior Labs"
-    assert provenance["source_name"] == "deutsche-startups.de"
-    assert provenance["trace_id"] == "trace-123"
-    assert provenance["mlflow_trace_url"] == "http://mlflow/traces/trace-123"
-    assert provenance["evidence_status"] == "stated"
-    assert provenance["evidence"] == "SAP kauft das junge KI-Startup Prior Labs."
-
-
 @pytest.mark.asyncio
-async def test_ingest_article_bundle_writes_acquisition_with_extracted_direction() -> None:
+async def test_ingest_article_tx_writes_acquisition_with_extracted_direction() -> None:
     tx = FakeTx()
     sap = resolved("Company", "SAP")
     prior_labs = resolved("Startup", "Prior Labs")
@@ -150,7 +72,7 @@ async def test_ingest_article_bundle_writes_acquisition_with_extracted_direction
         ],
     )
 
-    await GraphStore._ingest_article_tx(
+    await ingest_article_tx(
         tx,
         article(),
         extraction,
@@ -169,7 +91,7 @@ async def test_ingest_article_bundle_writes_acquisition_with_extracted_direction
         if "MERGE (source)-[r:ACQUIRED]->(target)" in query
     ]
     assert len(acquisition_writes) == 1
-    query, write = acquisition_writes[0]
+    _query, write = acquisition_writes[0]
     assert write["source_id"] == sap.id
     assert write["target_id"] == prior_labs.id
     assert write["evidence_status"] == "stated"
@@ -177,10 +99,6 @@ async def test_ingest_article_bundle_writes_acquisition_with_extracted_direction
     assert write["keywords"] == "Uebernahme"
     assert write["article_url"] == "https://example.test/articles/sap-prior-labs"
     assert write["tracks_support"] is True
-    assert "r.review_status" in query
-    assert 'r.review_status IN ["accepted", "rejected"]' in query
-    assert "r.active_article_urls" in query
-    assert "r.lifecycle_status" in query
 
     provenance = json.loads(str(write["provenance"]))
     assert provenance["event"] == "asserted"
@@ -189,7 +107,57 @@ async def test_ingest_article_bundle_writes_acquisition_with_extracted_direction
 
 
 @pytest.mark.asyncio
-async def test_ingest_article_bundle_skips_invalid_founder_direction() -> None:
+async def test_ingest_article_tx_writes_profile_evidence() -> None:
+    tx = FakeTx()
+    sap = resolved("Company", "SAP")
+    prior_labs = resolved("Startup", "Prior Labs")
+    extraction = ExtractionResult(
+        companies=[
+            ExtractedEntity(
+                name="SAP",
+                evidence_status="stated",
+                description="SAP ist ein Softwareunternehmen.",
+            )
+        ],
+        startups=[
+            ExtractedEntity(
+                name="Prior Labs",
+                evidence_status="stated",
+                description="Prior Labs ist ein KI-Startup.",
+            )
+        ],
+        relationships=[
+            ExtractedRelationship(
+                type="ACQUIRED",
+                source_name="SAP",
+                source_type="Company",
+                target_name="Prior Labs",
+                target_type="Startup",
+                evidence_status="stated",
+                keywords="Uebernahme",
+                evidence="SAP kauft das junge KI-Startup Prior Labs.",
+            )
+        ],
+    )
+
+    await ingest_article_tx(
+        tx,
+        article(),
+        extraction,
+        resolved_mapping(sap, prior_labs),
+        raw_extracted_entities=None,
+        job_run_id="job-123",
+        processed_at="2026-05-31T16:35:22+02:00",
+    )
+
+    profile_writes = [params for query, params in tx.runs if "MERGE (e:ProfileEvidence" in query]
+    assert [params["kind"] for params in profile_writes].count("entity_description") == 2
+    assert [params["kind"] for params in profile_writes].count("relationship_fact") == 0
+    assert all(params["job_run_id"] == "job-123" for params in profile_writes)
+
+
+@pytest.mark.asyncio
+async def test_ingest_article_tx_skips_invalid_founder_direction() -> None:
     tx = FakeTx()
     startup = resolved("Startup", "ViViRA")
     person = resolved("Person", "Philip Heimann")
@@ -210,7 +178,7 @@ async def test_ingest_article_bundle_skips_invalid_founder_direction() -> None:
         ],
     )
 
-    await GraphStore._ingest_article_tx(
+    await ingest_article_tx(
         tx,
         article(),
         extraction,

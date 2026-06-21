@@ -13,8 +13,15 @@ from app.core.config import get_settings
 from app.core.logging import get_logger, setup_logging
 from app.db.neo4j import Neo4jClient
 from app.observability import init_mlflow
-from app.graph.graph_store import GraphStore
+from app.graph.admin_store import AdminStore
+from app.graph.article_graph_writer import ArticleGraphWriter
+from app.graph.claim_store import ClaimStore
+from app.graph.entity_profile_store import EntityProfileStore
+from app.graph.entity_resolution_store import EntityResolutionStore
+from app.graph.graph_read_store import GraphReadStore
+from app.graph.insight_store import InsightStore
 from app.services.embedding import build_embedding_service
+from app.services.entity_curation import EntityProfileCurationService
 from app.services.ingestion import IngestionService
 from app.services.llm import LLMExtractionService
 from app.services.scraper import ArticleScraper
@@ -40,22 +47,46 @@ REQUEST_LATENCY = Histogram(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     neo4j = Neo4jClient(settings)
-    graph = GraphStore(neo4j)
+    claim_store = ClaimStore(neo4j)
+    admin_store = AdminStore(neo4j, claim_store)
+    graph_read_store = GraphReadStore(neo4j)
+    insight_store = InsightStore(neo4j)
+    entity_resolution_store = EntityResolutionStore(neo4j)
+    entity_profile_store = EntityProfileStore(neo4j)
+    article_graph_writer = ArticleGraphWriter(neo4j)
     llm = LLMExtractionService(settings)
     embedding = build_embedding_service(settings, llm._client)
+    profile_curation = (
+        EntityProfileCurationService(
+            settings=settings,
+            llm=llm,
+            embedding=embedding,
+            profile_store=entity_profile_store,
+        )
+        if settings.enable_entity_description_curation
+        else None
+    )
     scraper = ArticleScraper(settings)
 
     app.state.settings = settings
     app.state.neo4j = neo4j
-    app.state.graph = graph
+    app.state.admin_store = admin_store
+    app.state.claim_store = claim_store
+    app.state.graph_read_store = graph_read_store
+    app.state.insight_store = insight_store
+    app.state.entity_resolution_store = entity_resolution_store
+    app.state.entity_profile_store = entity_profile_store
+    app.state.article_graph_writer = article_graph_writer
     app.state.llm = llm
     app.state.scraper = scraper
     app.state.ingestion = IngestionService(
         settings=settings,
         scraper=scraper,
         llm=llm,
-        graph=graph,
+        article_writer=article_graph_writer,
+        resolution_store=entity_resolution_store,
         embedding=embedding,
+        profile_curation=profile_curation,
     )
     app.state.tasks = TaskManager()
 
@@ -63,7 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await neo4j.verify()
         logger.info("neo4j_connected", extra={"event": "startup", "workflow_step": "database"})
         if settings.apply_schema_on_startup:
-            await graph.apply_schema(settings.embedding_provider)
+            await admin_store.apply_schema(settings.embedding_provider)
     except Exception as exc:
         logger.warning(
             "neo4j_unavailable",

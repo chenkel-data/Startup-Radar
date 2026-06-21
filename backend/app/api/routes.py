@@ -9,15 +9,30 @@ from app.models.extraction import (
     TaskStatus,
 )
 from app.observability import log_extraction_feedback
-from app.graph.graph_store import GraphStore
+from app.graph.admin_store import AdminStore
+from app.graph.claim_store import ClaimStore
+from app.graph.graph_read_store import GraphReadStore
+from app.graph.insight_store import InsightStore
 from app.services.ingestion import IngestionService
 from app.services.tasks import TaskManager
 
 router = APIRouter()
 
 
-def _graph(request: Request) -> GraphStore:
-    return request.app.state.graph
+def _admin(request: Request) -> AdminStore:
+    return request.app.state.admin_store
+
+
+def _claims(request: Request) -> ClaimStore:
+    return request.app.state.claim_store
+
+
+def _graph_read(request: Request) -> GraphReadStore:
+    return request.app.state.graph_read_store
+
+
+def _insights(request: Request) -> InsightStore:
+    return request.app.state.insight_store
 
 
 def _ingestion(request: Request) -> IngestionService:
@@ -44,7 +59,7 @@ async def health(request: Request) -> dict:
 
 @router.post("/schema/apply")
 async def apply_schema(request: Request) -> dict:
-    await _graph(request).apply_schema()
+    await _admin(request).apply_schema()
     return {"status": "applied"}
 
 
@@ -74,12 +89,12 @@ async def search(
     q: str = Query(..., min_length=1),
     limit: int = Query(default=15, ge=1, le=50),
 ) -> list[SearchResult]:
-    return await _graph(request).search(q, limit)
+    return await _graph_read(request).search(q, limit)
 
 
 @router.get("/startup/{name:path}")
 async def startup(request: Request, name: str) -> dict:
-    profile = await _graph(request).entity_profile("Startup", name)
+    profile = await _graph_read(request).entity_profile("Startup", name)
     if not profile:
         raise HTTPException(status_code=404, detail="Startup not found")
     return profile
@@ -87,7 +102,7 @@ async def startup(request: Request, name: str) -> dict:
 
 @router.get("/investor/{name:path}")
 async def investor(request: Request, name: str) -> dict:
-    graph = _graph(request)
+    graph = _graph_read(request)
     for label in ("Investor", "Company", "Person"):
         profile = await graph.entity_profile(label, name)
         if not profile:
@@ -102,7 +117,7 @@ async def investor(request: Request, name: str) -> dict:
 @router.delete("/graph")
 async def clear_graph(request: Request) -> dict:
     """Delete every node and relationship in Neo4j for a clean re-ingest run."""
-    deleted = await _graph(request).clear_all()
+    deleted = await _admin(request).clear_all()
     return {"status": "cleared", "deleted_nodes": deleted}
 
 
@@ -113,12 +128,17 @@ async def graph(
     limit: int = Query(default=120, ge=10, le=500),
     view: str = Query(default="landscape", pattern="^(landscape|feed)$"),
 ) -> GraphResponse:
-    return await _graph(request).graph(entity=entity, limit=limit, view=view)
+    return await _graph_read(request).graph(entity=entity, limit=limit, view=view)
+
+
+@router.get("/entities/counts")
+async def entity_counts(request: Request) -> dict[str, int]:
+    return await _graph_read(request).entity_counts()
 
 
 @router.get("/nodes/{node_id}/claims")
 async def node_claims(request: Request, node_id: str) -> dict:
-    claims = await _graph(request).node_claims(node_id)
+    claims = await _claims(request).node_claims(node_id)
     if not claims:
         raise HTTPException(status_code=404, detail="Node not found")
     return claims
@@ -126,7 +146,7 @@ async def node_claims(request: Request, node_id: str) -> dict:
 
 @router.post("/claims/review")
 async def review_claim(request: Request, body: ClaimReviewIn) -> dict:
-    reviewed = await _graph(request).review_claim(
+    reviewed = await _claims(request).review_claim(
         source_id=body.source_id,
         relationship=body.relationship,
         target_id=body.target_id,
@@ -145,7 +165,7 @@ async def trending_startups(
     days: int = Query(default=30, ge=1, le=365),
     limit: int = Query(default=10, ge=1, le=50),
 ) -> list[dict]:
-    return await _graph(request).trending_startups(days=days, limit=limit)
+    return await _insights(request).trending_startups(days=days, limit=limit)
 
 
 @router.get("/insights/top-investors")
@@ -153,7 +173,7 @@ async def top_investors(
     request: Request,
     limit: int = Query(default=10, ge=1, le=50),
 ) -> list[dict]:
-    return await _graph(request).top_investors(limit=limit)
+    return await _insights(request).top_investors(limit=limit)
 
 
 @router.get("/insights/co-investments")
@@ -161,7 +181,7 @@ async def co_investments(
     request: Request,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[dict]:
-    return await _graph(request).co_investments(limit=limit)
+    return await _insights(request).co_investments(limit=limit)
 
 
 @router.get("/insights/topic-clusters")
@@ -169,7 +189,7 @@ async def topic_clusters(
     request: Request,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[dict]:
-    return await _graph(request).topic_clusters(limit=limit)
+    return await _insights(request).topic_clusters(limit=limit)
 
 
 @router.post("/traces/{trace_id}/feedback")

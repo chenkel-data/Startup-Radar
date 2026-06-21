@@ -16,6 +16,10 @@ _BASE_STATEMENTS = [
     "CREATE CONSTRAINT topic_id IF NOT EXISTS FOR (n:Topic) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT source_id IF NOT EXISTS FOR (n:Source) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT company_id IF NOT EXISTS FOR (n:Company) REQUIRE n.id IS UNIQUE",
+    (
+        "CREATE CONSTRAINT profile_evidence_id IF NOT EXISTS "
+        "FOR (n:ProfileEvidence) REQUIRE n.id IS UNIQUE"
+    ),
     "CREATE INDEX startup_canonical_name IF NOT EXISTS FOR (n:Startup) ON (n.canonical_name)",
     "CREATE INDEX investor_canonical_name IF NOT EXISTS FOR (n:Investor) ON (n.canonical_name)",
     "CREATE INDEX person_canonical_name IF NOT EXISTS FOR (n:Person) ON (n.canonical_name)",

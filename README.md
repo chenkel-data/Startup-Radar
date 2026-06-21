@@ -18,6 +18,8 @@ flowchart LR
   Parser --> Gate[Evidence gate]
   Gate --> Resolver[Entity resolution]
   Resolver --> Graph[(Neo4j)]
+  Graph --> DescriptionCheck[Optional review + curation step]
+  DescriptionCheck --> Graph
   Graph --> API[FastAPI]
   API --> UI[React graph UI]
 
@@ -26,6 +28,7 @@ flowchart LR
   Gate -. admitted vs dropped .-> MLflow
   Resolver -. merge decisions .-> MLflow
   Graph -. write results .-> MLflow
+  DescriptionCheck -. review + curation traces .-> MLflow
 ```
 
 ## What It Does
@@ -59,22 +62,36 @@ It writes relationship claims such as:
 Every persisted claim keeps evidence, source articles, lifecycle state, review
 state, and MLflow trace references.
 
+After entity resolution, an additional AI curation step can review resolved entity profiles. An entity profile is the source-backed description and related metadata (including evidence and traces) attached to the entity, such as a startup, investor, person, company, or topic
+
+Profiles are revised as more evidence arrives. A profile created from one article
+may be incomplete, too closely reflect that article's angle, or become stale over
+time. The curation step compares new article evidence with the current profile
+and decides whether to keep it, update it, or flag it for human review. The
+backend records which evidence has already been considered for each entity, so
+unchanged policies (unchanged prompts for review and curation) do not trigger the same review again.
+
+
+
 ## Motivation
 
-Startup ecosystem information is scattered across many articles. Funding rounds,
-founders, acquisitions, investors, partnerships, and technology themes are often
-present only as prose, making them hard to search, compare, or query across
-time.
+### Connecting the dots.
 
-Startup Radar shows how a knowledge graph can turn that
-unstructured data into structured, explorable information. Instead of
-reading article by article, the graph view makes patterns visible: which
-investors backed which startups, which companies are acquiring startups, which
-topics are emerging, which claims are supported by which articles, and which
-relationships need human review.
+
+Startup ecosystems move fast, and the pieces of information are scattered across
+articles and time. Who founded a company, who backed it, what it is building, who it partners with,
+and how its story changes over time usually requires connecting separate pieces of information into a coherent view.
+
+
+
+Startup Radar shows how a knowledge graph can turn that scattered and 
+unstructured article data into structured, explorable information. It connects articles, entities, relationship
+claims, and sources so users can trace where information came from, see how
+companies, people, and investors relate to one another, and review claims that
+need human judgment.
 
 The project demonstrates a realistic and production-shaped full-stack AI workflow, not a
-prompt-only demo. It includes the surrounding system that makes LLM extraction and knowledge graph usable:
+prompt-only demo. It includes the surrounding system that makes LLM extraction and knowledge graphs actually usable:
 
 | Concern | Implementation |
 | --- | --- |
@@ -83,6 +100,7 @@ prompt-only demo. It includes the surrounding system that makes LLM extraction a
 | Evidence handling | `stated`, `attributed`, and `unsure` claim states |
 | Safety gate | Only admitted extracted facts become supported graph claims |
 | Entity resolution | Normalization, fuzzy matching, and optional embeddings |
+| Entity curation | Optional review of Entitie's Profile (update, keep, or flag)|
 | Provenance | Article URLs, evidence text, trace IDs, and trace links |
 | Human review | Accept, reject, or reset graph claims |
 | Observability | MLflow runs, traces, spans, prompts, artifacts, and feedback |
@@ -151,6 +169,7 @@ sequenceDiagram
   participant Parser as Parser
   participant Resolver as Entity Resolver
   participant Neo4j as Neo4j
+  participant Descriptions as Entity Review and Curation
   participant MLflow as MLflow
 
   UI->>API: POST /ingest
@@ -168,6 +187,11 @@ sequenceDiagram
     Resolver-->>MLflow: exact/fuzzy/embedding outcomes
     API->>Neo4j: write nodes, claims, evidence, provenance
     Neo4j-->>MLflow: graph operation counts
+    opt description check enabled
+      API->>Descriptions: compare descriptions with new evidence
+      Descriptions-->>MLflow: description decision trace
+      Descriptions->>Neo4j: save description status and trace link
+    end
   end
 
   API->>MLflow: metrics and artifacts
@@ -184,29 +208,59 @@ sequenceDiagram
 | Parsing | Convert raw model output into typed Pydantic records |
 | Evidence gate | Admit `stated` and `attributed`; quarantine `unsure` |
 | Entity resolution | Merge duplicates through exact, fuzzy, and embedding-based matching |
-| Graph write | Persist entities, article support, claims, evidence, and provenance |
-| Review | Mark conflicting or changed claims and allow human decisions |
+| Graph write | Persist entities, claims, article support, and provenance |
+| Entity curation | Optionally review whether entity description should be updated |
+| Human review | Mark conflicting or changed claims and allow human decisions |
 | Observability | Attach run metrics, trace spans, prompt versions, artifacts, and feedback |
 
 ## Claim Lifecycle
 
 ```mermaid
 stateDiagram-v2
+  direction LR
+  state "Needs review" as NeedsReview
+
   [*] --> Extracted
   Extracted --> Quarantined: unsure or invalid
-  Extracted --> Supported: stated or attributed
-  Supported --> NeedsReview: conflict or support change
-  NeedsReview --> Accepted: reviewer accepts
-  NeedsReview --> Rejected: reviewer rejects
-  Accepted --> NeedsReview: later conflict
-  Supported --> Unsupported: source reprocessed without claim
+  Extracted --> Supported: admitted evidence
+  Supported --> NeedsReview: conflict found
+  Supported --> Unsupported: final support lost
+  Unsupported --> NeedsReview
+  NeedsReview --> Accepted: accept
+  NeedsReview --> Rejected: reject
+  Accepted --> NeedsReview: new issue found
   Rejected --> [*]
 ```
 
-Review is deliberately claim-level. A rejected relationship is hidden from graph
+A relationship stays supported while at least one active article still
+reproduces it. Losing the final active source marks the claim unsupported and
+queues it for review. Conflicts can queue review while the claim remains
+supported.
+
+Review is claim-level. A rejected relationship is hidden from graph
 views, while accepted claims keep their support and provenance.
 
-## Data Model
+### Relationship Review Cases
+
+The review tab keeps each relationship card focused on the current decision:
+keep the relationship, reject it, or reset a previous decision. A card shows the
+relationship, why it needs attention, the article that caused the state, one
+evidence quote, and the available actions. Full extraction history stays in the
+trace and provenance views.
+
+- `Missing in latest extraction`: the final active source no longer produced
+  this relationship in the latest run.
+- `Direction changed`: the final active source now produced the same
+  relationship in the opposite direction.
+- `Conflicting direction`: both directions are active in the graph.
+- `Competing claim`: the same entities have incompatible relationship types,
+  such as `ACQUIRED` and `MERGED_WITH`.
+- `Supported`: the relationship still has current article support.
+- `Accepted`: a reviewer confirmed the relationship.
+- `Rejected`: a reviewer rejected the relationship, so it is hidden from graph
+  views unless it is reset.
+
+## (Graph-) Data Model
 
 ```mermaid
 flowchart TD
@@ -225,18 +279,6 @@ flowchart TD
   Startup -->|HAS_TOPIC| Topic
 ```
 
-Claim relationships store:
-
-- `evidence_status`
-- `evidence`
-- `keywords`
-- `article_urls` and `active_article_urls`
-- `article_titles`
-- `lifecycle_status`
-- `review_status`
-- `review_reasons`
-- `review_history`
-- provenance entries with article, trace, run, and timestamp metadata
 
 ## Observability With MLflow
 
@@ -255,12 +297,21 @@ flowchart LR
   Traces --> Gate[Evidence gate]
   Traces --> Resolve[Entity resolution]
   Traces --> Write[Neo4j write]
+  Traces --> Curation[Entity curation]
   Traces --> Feedback[Human feedback]
 ```
 
 Run-level tracking includes source settings, model configuration, prompt URIs,
 article counts, extraction counts, evidence counts, graph operation totals,
-entity resolution outcomes, token usage, and latency.
+entity resolution outcomes, token usage, estimated LLM cost, and latency. LLM
+cost metrics are split by workflow step, including extraction, gleaning, and
+entity curation.
+
+For MLflow's GenAI Overview dashboard, Startup Radar labels OpenAI spans with
+the workflow step, such as `gpt-4.1-mini / extraction`, so costs can be compared
+across extraction, gleaning, profile review, and profile curation. It also labels
+the same spans with a per-model total, such as `gpt-4.1-mini / total`, so the
+dashboard can show total model cost.
 
 Article traces include:
 
@@ -268,13 +319,14 @@ Article traces include:
 | --- | --- |
 | `process_article` | Root trace for one article |
 | `extract_entities` | LLM orchestration and extraction audit |
-| OpenAI chat span | Prompt, response, tokens, model metadata |
+| `OpenAI chat span` | Prompt, response, tokens, model metadata |
 | `gleaning_pass` | Follow-up extraction corrections |
 | `parse_extraction_response` | Raw delimiter rows to typed output |
 | `evidence_gate` | Claims admitted or dropped |
 | `resolve_entities` | Batch entity resolution summary |
 | `resolve_entity` | Exact/fuzzy/embedding decision for one entity |
 | `write_to_neo4j` | Graph write operation count |
+| `curate_resolved_entity_profiles` | Starts optional entity profile curation |
 
 Run artifacts include:
 
@@ -284,6 +336,8 @@ Run artifacts include:
 | `extraction_summary.jsonl` | Per-article extraction counts |
 | `graph_ops.jsonl` | Per-article graph write results |
 | `extraction_dump.jsonl` | Structured extraction payloads |
+| `entity_description_curation.jsonl` | curation results per entity |
+| `llm_costs.jsonl` | Per-LLM-call token and cost rows by workflow step |
 | `failed_articles.jsonl` | Failed article URLs and errors |
 | `dedup_report.json` | Entity resolution outcomes |
 
@@ -296,10 +350,11 @@ to MLflow Prompt Registry at startup and loads the configured aliases:
 | --- | --- |
 | `MLFLOW_PROMPT_EXTRACTION_URI` | `prompts:/article_extraction@champion` |
 | `MLFLOW_PROMPT_GLEANING_URI` | `prompts:/article_extraction_gleaning@champion` |
+| `MLFLOW_PROMPT_PROFILE_REVIEW_URI` | `prompts:/entity_profile_review@champion` |
+| `MLFLOW_PROMPT_PROFILE_CURATION_URI` | `prompts:/entity_profile_curation@champion` |
 
-The extraction prompt and gleaning prompt are linked to traces when loaded from
-the registry, so each article trace can be tied back to the prompt version that
-created it.
+Extraction, gleaning, entity review and curation prompts are
+linked to traces when loaded from the registry, so each article or decision can be tied back to the prompt version that created it.
 
 ## Repository Layout
 
@@ -341,6 +396,8 @@ Important environment variables:
 | `LLM_TIMEOUT_SECONDS` | Timeout per LLM request |
 | `LLM_RETRY_ATTEMPTS` | Application-level extraction retries |
 | `LLM_GLEANING_PASSES` | Additional extraction review passes |
+| `ENABLE_ENTITY_DESCRIPTION_CURATION` | Enables optional entity profile curation |
+| `ENTITY_CURATION_MAX_CONCURRENCY` | Maximum parallel profile reviews |
 | `EMBEDDING_PROVIDER` | `openai` or `sentence-transformers` |
 | `EMBEDDING_MODEL` | OpenAI embedding model |
 | `ENABLE_EMBEDDING_RESOLUTION` | Enables Neo4j vector matching |
@@ -350,6 +407,8 @@ Important environment variables:
 | `MLFLOW_TRACKING_URI` | Backend-facing MLflow tracking URI |
 | `MLFLOW_PUBLIC_URL` | Browser-facing MLflow URL used in trace links |
 | `MLFLOW_USE_PROMPT_REGISTRY` | Loads prompts from MLflow Prompt Registry |
+| `MLFLOW_PROMPT_PROFILE_REVIEW_URI` | Prompt Registry URI for profile review |
+| `MLFLOW_PROMPT_PROFILE_CURATION_URI` | Prompt Registry URI for writing updated descriptions |
 | `SCRAPE_TIMEOUT_SECONDS` | Per-request scraping timeout |
 | `MAX_ARTICLES_PER_INGEST` | Hard cap for one ingestion job |
 
@@ -439,8 +498,9 @@ curl -X DELETE http://localhost:8000/graph
 | `POST` | `/schema/apply` | Apply Neo4j schema |
 | `POST` | `/ingest` | Start an async ingestion job |
 | `GET` | `/ingest/{task_id}` | Poll ingestion status |
-| `GET` | `/graph` | Fetch graph data |
+| `GET` | `/graph` | Fetch landscape, focused, or article-feed graph data |
 | `DELETE` | `/graph` | Clear all graph data |
+| `GET` | `/entities/counts` | Count graph entities by type |
 | `GET` | `/search?q=...` | Search graph entities |
 | `GET` | `/nodes/{node_id}/claims` | Inspect claims for one node |
 | `POST` | `/claims/review` | Accept, reject, or reset a claim |
@@ -457,28 +517,41 @@ curl -X DELETE http://localhost:8000/graph
 
 - Force-directed graph exploration
 - Search-driven focused subgraphs
-- Landscape and article-feed graph views
+- Node and relationship filters with current graph counts
 - Entity detail panel with relationships and article support
-- Claim filters for review, supported, and all claims
-- Human review actions for suspicious claims
-- Raw extraction and article provenance inspection
+- Compact relationship cards for review, supported, accepted, and rejected claims
+- Human review actions for suspicious, changed, and conflicting claims
+- Entity profile status and MLflow trace links
+- Latest article extraction traces for selected entity
 - Direct MLflow trace links from claims and articles
 - Market pulse panels for trending startups, top investors, co-investments,
   and topic clusters
-
 
 ## Debugging A Claim
 
 When a graph relationship looks wrong, follow the evidence path:
 
 1. Open the claim in the frontend.
-2. Read the evidence sentence and supporting article list.
+2. Read the review state, source article, and evidence sentence.
 3. Open the MLflow trace from the claim.
 4. Check the OpenAI response to see what the model produced.
 5. Check `parse_extraction_response` to see what was parsed.
 6. Check `evidence_gate` to see why the claim was admitted.
-7. Check entity resolution spans to see whether endpoints were merged correctly.
+7. Check entity resolution spans to see whether entities were merged correctly.
 8. Accept, reject, or reset the claim from the review controls.
 
 That workflow is the core product idea: every graph edge should be inspectable,
 reviewable, and traceable back to the article and AI workflow that created it.
+
+## Debugging An Entity Profile
+
+When an entity description looks wrong or stale:
+
+1. Open the entity in the frontend.
+2. Check the description status under the entity name.
+3. Open the linked MLflow trace.
+4. Inspect `profile_evidence_context` for the article evidences used.
+5. Inspect `review_entity_profile` for the keep, update, or flag decision.
+6. If the description changed, inspect `curate_entity_profile` for the new text.
+
+Profile curations are policy-aware. The same article is not reviewed again for the same entity unless the policy changes (the review or curation prompt).

@@ -18,6 +18,14 @@ export type GraphResponse = {
   edges: GraphEdge[];
 };
 
+export type EntityCounts = {
+  Startup: number;
+  Investor: number;
+  Company: number;
+  Person: number;
+  Topic: number;
+};
+
 export type ClaimAssertion = {
   event: "asserted" | "not_reproduced" | "direction_changed" | "processed" | string;
   article_id?: string;
@@ -41,6 +49,18 @@ export type ClaimReviewEvent = {
   reviewed_at?: string;
 };
 
+export type ClaimSourceArticle = {
+  article_url?: string;
+  article_title?: string;
+  published_at?: string;
+  latest_processed_at?: string;
+  status: "current" | "no_longer_current" | "direction_changed" | "historical" | string;
+  evidence?: string;
+  trace_url?: string;
+  processing_count: number;
+  review_source?: boolean;
+};
+
 export type NodeClaim = {
   edge_id: string;
   relationship: string;
@@ -59,6 +79,8 @@ export type NodeClaim = {
   review_history?: ClaimReviewEvent[];
   support_changed: boolean;
   active_support_count: number;
+  active_article_urls?: string[];
+  source_articles?: ClaimSourceArticle[];
   assertions: ClaimAssertion[];
   source_id: string;
   target_id: string;

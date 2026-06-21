@@ -1,4 +1,5 @@
 import type {
+  EntityCounts,
   GraphResponse,
   InsightRow,
   NodeClaimsResponse,
@@ -39,6 +40,10 @@ export const api = {
     const params = new URLSearchParams({ limit: String(limit) });
     if (entity) params.set("entity", entity);
     return request<GraphResponse>(`/graph?${params.toString()}`);
+  },
+
+  entityCounts() {
+    return request<EntityCounts>("/entities/counts");
   },
 
   nodeClaims(nodeId: string) {
