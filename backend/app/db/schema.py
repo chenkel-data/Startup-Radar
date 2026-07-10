@@ -26,6 +26,11 @@ _BASE_STATEMENTS = [
     "CREATE INDEX topic_canonical_name IF NOT EXISTS FOR (n:Topic) ON (n.canonical_name)",
     "CREATE INDEX company_canonical_name IF NOT EXISTS FOR (n:Company) ON (n.canonical_name)",
     "CREATE INDEX article_published_at IF NOT EXISTS FOR (n:Article) ON (n.published_at)",
+    "CREATE INDEX article_url IF NOT EXISTS FOR (n:Article) ON (n.url)",
+    (
+        "CREATE INDEX article_extraction_policy_hash IF NOT EXISTS "
+        "FOR (n:Article) ON (n.article_extraction_policy_hash)"
+    ),
     """
     CREATE FULLTEXT INDEX entitySearch IF NOT EXISTS
     FOR (n:Startup|Investor|Person|Topic|Company)
@@ -50,7 +55,3 @@ def build_schema_statements(provider: str = "openai") -> list[str]:
         for label in _ENTITY_LABELS
     ]
     return _BASE_STATEMENTS + vector_indexes
-
-
-# Default schema statements kept for backwards-compatibility
-SCHEMA_STATEMENTS = build_schema_statements("openai")

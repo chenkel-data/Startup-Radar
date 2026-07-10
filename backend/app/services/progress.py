@@ -17,6 +17,20 @@ def article_fields(
         "url": article.url,
         "article_title": truncate(article.title, 140),
     }
+    if article.primary_type:
+        fields["primary_type"] = article.primary_type
+    if article.cleaning:
+        fields.update(
+            {
+                "selected_container": article.cleaning.selected_container,
+                "text_chars_before": article.cleaning.text_chars_before,
+                "text_chars_after": article.cleaning.text_chars_after,
+                "removed_block_count": len(article.cleaning.removed_blocks),
+                "remaining_promotion_marker_count": len(
+                    article.cleaning.remaining_promotion_markers
+                ),
+            }
+        )
     if article_index is not None:
         fields["article_index"] = article_index
     if article_total is not None:

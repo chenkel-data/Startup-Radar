@@ -86,7 +86,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         article_writer=article_graph_writer,
         resolution_store=entity_resolution_store,
         embedding=embedding,
-        profile_curation=profile_curation,
+        profile_curation_policy_hash=(
+            profile_curation.profile_curation_policy_hash if profile_curation else None
+        ),
     )
     app.state.tasks = TaskManager()
 

@@ -17,6 +17,32 @@ from app.models.extraction import GraphResponse, SearchResult
 from app.services.entity_resolution import NameNormalizer
 
 
+def _role_projection(node_variable: str) -> str:
+    supported = (
+        'coalesce(role_rel.lifecycle_status, "supported") = "supported" '
+        'AND coalesce(role_rel.review_status, "unreviewed") IN ["unreviewed", "accepted"]'
+    )
+    return f"""[
+      role IN [
+        CASE WHEN COUNT {{ ({node_variable})-[role_rel:INVESTED_IN]->()
+          WHERE {supported} }} > 0 THEN "investor" END,
+        CASE WHEN COUNT {{ ()-[role_rel:INVESTED_IN]->({node_variable})
+          WHERE {supported} }} > 0 THEN "investment_recipient" END,
+        CASE WHEN COUNT {{ ({node_variable})-[role_rel:ACQUIRED]->()
+          WHERE {supported} }} > 0 THEN "acquirer" END,
+        CASE WHEN COUNT {{ ()-[role_rel:ACQUIRED]->({node_variable})
+          WHERE {supported} }} > 0 THEN "acquisition_target" END,
+        CASE WHEN COUNT {{ ()-[role_rel:EMPLOYED_BY]->({node_variable})
+          WHERE {supported} }} > 0 THEN "employer" END,
+        CASE WHEN COUNT {{ ({node_variable})-[role_rel:EMPLOYED_BY]->()
+          WHERE {supported} }} > 0 THEN "employee" END,
+        CASE WHEN COUNT {{ ({node_variable})-[role_rel:PARTNERED_WITH]-()
+          WHERE {supported} }} > 0 THEN "partner" END
+      ]
+      WHERE role IS NOT NULL
+    ]"""
+
+
 class GraphReadStore:
     def __init__(self, neo4j: Neo4jClient):
         self.neo4j = neo4j
@@ -44,9 +70,9 @@ class GraphReadStore:
         if not query.strip():
             return []
         lucene = _lucene_query(query)
-        fulltext_statement = """
+        fulltext_statement = f"""
         CALL db.index.fulltext.queryNodes("entitySearch", $search_query) YIELD node, score
-        RETURN node, score
+        RETURN node, score, {_role_projection("node")} AS roles
         ORDER BY score DESC
         LIMIT $limit
         """
@@ -60,7 +86,7 @@ class GraphReadStore:
                 rows = [record async for record in result]
                 if rows:
                     results = [
-                        _search_result(record["node"], record["score"])
+                        _search_result(record["node"], record["score"], record["roles"])
                         for record in rows
                         if not is_geography_topic_node(record["node"])
                     ]
@@ -72,7 +98,7 @@ class GraphReadStore:
                 extra={"event": "search", "workflow_step": "fulltext", "error": str(exc)},
             )
 
-        partial_query = """
+        partial_query = f"""
         MATCH (n)
         WHERE any(label IN labels(n) WHERE label IN ["Startup", "Investor", "Company", "Person", "Topic"])
           AND (
@@ -80,13 +106,13 @@ class GraphReadStore:
             toLower(coalesce(n.canonical_name, "")) CONTAINS $needle OR
             any(alias IN coalesce(n.aliases, []) WHERE toLower(alias) CONTAINS $needle)
           )
-        RETURN n AS node, 1.0 AS score
+        RETURN n AS node, 1.0 AS score, {_role_projection("n")} AS roles
         LIMIT $limit
         """
         async with self.neo4j.session() as session:
             result = await session.run(partial_query, needle=query.casefold(), limit=limit)
             return [
-                _search_result(record["node"], record["score"])
+                _search_result(record["node"], record["score"], record["roles"])
                 async for record in result
                 if not is_geography_topic_node(record["node"])
             ]
@@ -103,11 +129,13 @@ class GraphReadStore:
         )
         OPTIONAL MATCH (n)-[r]-(m)
         RETURN n AS node,
+               {_role_projection("n")} AS roles,
                collect(DISTINCT {{
                  id: m.id,
                  name: coalesce(m.name, m.title),
                  type: head(labels(m)),
-                 relationship: type(r)
+                 relationship: type(r),
+                 direction: CASE WHEN startNode(r) = n THEN "outgoing" ELSE "incoming" END
                }})[0..50] AS related
         LIMIT 1
         """
@@ -124,6 +152,7 @@ class GraphReadStore:
                 "name": node.get("name"),
                 "type": list(node.labels)[0],
                 "properties": public_node_properties(dict(node)),
+                "roles": list(record["roles"] or []),
                 "related": [item for item in record["related"] if item.get("id")],
             }
 
@@ -256,7 +285,7 @@ def _lucene_query(query: str) -> str:
     return " AND ".join(f"{term}*" for term in terms)
 
 
-def _search_result(node: Node, score: float) -> SearchResult:
+def _search_result(node: Node, score: float, roles: list[str] | None = None) -> SearchResult:
     labels = [
         label
         for label in node.labels
@@ -269,6 +298,7 @@ def _search_result(node: Node, score: float) -> SearchResult:
         score=float(score),
         aliases=node.get("aliases") or [],
         description=node.get("description"),
+        roles=roles or [],
     )
 
 

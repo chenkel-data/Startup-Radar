@@ -1,0 +1,215 @@
+{
+  "ontology_version": "source-only-broad-topics-v1",
+  "topics": [
+    {
+      "concept_id": "agtech",
+      "name": "AgTech",
+      "aliases": ["Agricultural Technology"],
+      "definition": "Technologie für Landwirtschaft, Pflanzenproduktion, landwirtschaftliche Systeme und Lebensmittelanbau in kontrollierten Umgebungen.",
+      "semantic_boundary": "Schließt gewöhnliche Lebensmittelprodukte und landwirtschaftliche Betriebe ohne technologiezentriertes Landwirtschafts- oder Anbausystem aus."
+    },
+    {
+      "concept_id": "ai",
+      "name": "AI",
+      "aliases": ["KI", "Künstliche Intelligenz", "Artificial Intelligence"],
+      "definition": "Software und Systeme, die Aufgaben des Lernens, Schlussfolgerns, Erkennens, Generierens oder der Entscheidungsunterstützung ausführen.",
+      "semantic_boundary": "Erfordert eine ausdrückliche KI- oder AI-Funktion; allgemeine Software, Analytik und Automatisierung allein sind ausgeschlossen."
+    },
+    {
+      "concept_id": "augmented-reality",
+      "name": "Augmented Reality",
+      "aliases": ["AR"],
+      "definition": "Technologie, die interaktive digitale Inhalte über eine Ansicht der physischen Welt legt.",
+      "semantic_boundary": "Schließt gewöhnliche 3D-Visualisierungen ohne Augmented-Reality-Anwendung aus."
+    },
+    {
+      "concept_id": "additive-manufacturing",
+      "name": "Additive Manufacturing",
+      "aliases": ["3D Printing", "3D-Druck"],
+      "definition": "Fertigungstechnologie, die physische Teile Schicht für Schicht aus digitalen Entwürfen herstellt.",
+      "semantic_boundary": "Erfordert einen ausdrücklich genannten additiven Fertigungs- oder 3D-Druck-Produktionsprozess."
+    },
+    {
+      "concept_id": "climatetech",
+      "name": "ClimateTech",
+      "aliases": ["Climate Tech"],
+      "definition": "Technologien und Dienstleistungen, deren Hauptzweck Klimaschutz, Klimaanpassung, Dekarbonisierung oder die Unterstützung der Energiewende ist.",
+      "semantic_boundary": "Schließt allgemeine Nachhaltigkeitsaussagen ohne konkrete Klima- oder Dekarbonisierungsfunktion aus."
+    },
+    {
+      "concept_id": "constructiontech",
+      "name": "ConstructionTech",
+      "aliases": ["ConTech", "Construction Technology"],
+      "definition": "Technologie für Bauwesen, Bauprozesse, Baustoffe und den Baustellenbetrieb.",
+      "semantic_boundary": "Schließt gewöhnliche Bauleistungen ohne technologiegestütztes Produkt, Material oder Verfahren aus."
+    },
+    {
+      "concept_id": "cybersecurity",
+      "name": "Cybersecurity",
+      "aliases": ["IT Security"],
+      "definition": "Technologien und Dienstleistungen, die Systeme, Netzwerke, Anwendungen und Daten vor unbefugtem Zugriff, Manipulation oder Verlust schützen.",
+      "semantic_boundary": "Schließt allgemeine Aussagen zu Zuverlässigkeit, Compliance und Softwarequalität ohne Sicherheitsfunktion aus."
+    },
+    {
+      "concept_id": "creator-economy",
+      "name": "Creator Economy",
+      "aliases": ["CreatorTech"],
+      "definition": "Plattformen und Dienstleistungen, die Kreative beim Erstellen, Verbreiten, Monetarisieren oder Verwalten von Medien und publikumsorientierter Arbeit unterstützen.",
+      "semantic_boundary": "Schließt gewöhnliche Marketing- und Mediensoftware aus, wenn Kreative keine zentrale Marktrolle einnehmen."
+    },
+    {
+      "concept_id": "defensetech",
+      "name": "DefenseTech",
+      "aliases": ["Defense Tech", "Dual Use"],
+      "definition": "Technologien und Investitionen mit Fokus auf Verteidigung, nationale Sicherheit, Resilienz oder ausdrücklich dual nutzbare Anwendungen.",
+      "semantic_boundary": "Schließt allgemeine Industrie- oder Luft- und Raumfahrttechnik ohne genannten Verteidigungs-, Sicherheits- oder Dual-Use-Zweck aus."
+    },
+    {
+      "concept_id": "deeptech",
+      "name": "DeepTech",
+      "aliases": ["Deep Tech"],
+      "definition": "Wissenschafts- oder entwicklungsintensive Technologie, deren zentraler Vorteil auf umfangreicher technischer Forschung und Entwicklung beruht.",
+      "semantic_boundary": "Erfordert eine ausdrückliche DeepTech-Bezeichnung oder eine eindeutig forschungsintensive Kerntechnologie."
+    },
+    {
+      "concept_id": "e-commerce",
+      "name": "E-Commerce",
+      "aliases": ["Ecommerce", "Online Commerce"],
+      "definition": "Digitale Infrastruktur, Plattformen und Geschäftsmodelle für den Onlineverkauf von Waren oder Dienstleistungen.",
+      "semantic_boundary": "Schließt Software aus, die lediglich von Händlern genutzt wird, wenn Onlinehandel nicht zum Hauptzweck des Produkts gehört."
+    },
+    {
+      "concept_id": "energytech",
+      "name": "EnergyTech",
+      "aliases": ["Energy Tech"],
+      "definition": "Technologie für Energieerzeugung, Netze, Handel, Speicherung, Effizienz und den Betrieb von Energiemärkten.",
+      "semantic_boundary": "Schließt allgemeine Nachhaltigkeitsaussagen und gewöhnliche Energieversorger-Bezüge ohne Technologie- oder Energiemarktprodukt aus."
+    },
+    {
+      "concept_id": "fintech",
+      "name": "FinTech",
+      "aliases": ["Financial Technology"],
+      "definition": "Technologiegestützte Produkte und Dienstleistungen für Zahlungsverkehr, Bankwesen, Finanzen, Investitionen, Buchhaltung oder Finanzprozesse.",
+      "semantic_boundary": "Schließt Finanzfakten und Investoren ohne technologiegestütztes Finanzprodukt oder entsprechende Dienstleistung aus."
+    },
+    {
+      "concept_id": "foodtech",
+      "name": "FoodTech",
+      "aliases": ["Food Tech"],
+      "definition": "Technologiegestützte Produkte und Dienstleistungen für Lebensmittelproduktion, Zubereitung, Vertrieb, Gastronomie und kommerzielle Verpflegung.",
+      "semantic_boundary": "Schließt gewöhnliche Restaurants und Lebensmittelbetriebe ohne technologiegestütztes Produkt, Plattform oder Verfahren aus."
+    },
+    {
+      "concept_id": "govtech",
+      "name": "GovTech",
+      "aliases": ["Government Technology"],
+      "definition": "Technologie, die staatliche Verwaltung, öffentliche Dienstleistungen und regulatorische Leistungserbringung digitalisiert oder verbessert.",
+      "semantic_boundary": "Schließt Produkte aus, die lediglich an öffentliche Stellen verkauft werden, ohne eine Funktion für die öffentliche Verwaltung zu erfüllen."
+    },
+    {
+      "concept_id": "gaming",
+      "name": "Gaming",
+      "aliases": ["Games", "GameTech"],
+      "definition": "Technologien, Studios, Plattformen und Produkte für digitale Spiele und interaktive Spielerlebnisse.",
+      "semantic_boundary": "Schließt allgemeine Unterhaltung und Gamification aus, wenn Entwicklung, Vertrieb oder Betrieb von Spielen nicht zentral sind."
+    },
+    {
+      "concept_id": "healthtech",
+      "name": "HealthTech",
+      "aliases": ["Health Tech", "Digital Health"],
+      "definition": "Technologiegestützte Produkte und Dienstleistungen für Gesundheit, Pflege, Prävention, Diagnose, Behandlung oder medizinische Verwaltung.",
+      "semantic_boundary": "Schließt allgemeine Wellness- und gewöhnliche Gesundheitsdienstleistungen ohne technologiegestütztes Produkt oder Verfahren aus."
+    },
+    {
+      "concept_id": "hrtech",
+      "name": "HRTech",
+      "aliases": ["HR Tech", "RecruitingTech"],
+      "definition": "Technologie für Personalgewinnung, Arbeitsmarktplätze, Personalmanagement und Personalprozesse.",
+      "semantic_boundary": "Schließt gewöhnliche Arbeitgeber und Stellenanzeigen ohne HR-Technologieprodukt oder entsprechende Plattform aus."
+    },
+    {
+      "concept_id": "industrialtech",
+      "name": "IndustrialTech",
+      "aliases": ["Industrial Tech"],
+      "definition": "Technologie für industrielle Produktion, Fertigungssysteme, Fabriken und industrielle Abläufe.",
+      "semantic_boundary": "Schließt allgemeine B2B-Software und gewöhnliche Fertigung ohne technologiezentriertes Industrieprodukt aus."
+    },
+    {
+      "concept_id": "insurtech",
+      "name": "InsurTech",
+      "aliases": ["Insurance Technology"],
+      "definition": "Technologiegestützte Versicherungsprodukte und -prozesse für Vertrieb, Risikoprüfung, Schadensbearbeitung und Versicherungsbetrieb.",
+      "semantic_boundary": "Schließt allgemeine Finanzdienstleistungen und gewöhnliche Versicherer ohne technologiegestütztes Versicherungsprodukt oder Verfahren aus."
+    },
+    {
+      "concept_id": "iot",
+      "name": "IoT",
+      "aliases": ["Internet of Things"],
+      "definition": "Vernetzte physische Geräte, Sensoren und eingebettete Systeme, die Daten über Netzwerke austauschen.",
+      "semantic_boundary": "Erfordert eine ausdrückliche IoT-Bezeichnung oder ein eindeutig vernetztes Geräteprodukt; gewöhnliche Software und unvernetzte Hardware sind ausgeschlossen."
+    },
+    {
+      "concept_id": "legaltech",
+      "name": "LegalTech",
+      "aliases": ["Legal Tech"],
+      "definition": "Technologie, die juristische Recherche, Rechtsdienstleistungen oder juristische und administrative Fallarbeit unterstützt, automatisiert oder bereitstellt.",
+      "semantic_boundary": "Schließt allgemeine Compliance- oder Dokumentensoftware ohne Funktion für Rechtsdienstleistungen oder juristische Arbeitsabläufe aus."
+    },
+    {
+      "concept_id": "mobility",
+      "name": "Mobility",
+      "aliases": ["MobilityTech", "E-Mobility"],
+      "definition": "Technologien und Dienstleistungen für die Beförderung von Personen oder Gütern, einschließlich Fahrzeugen, Ladeinfrastruktur und Mobilitätsinfrastruktur.",
+      "semantic_boundary": "Schließt allgemeine Logistik- und Ortsbezüge ohne Mobilitätsprodukt oder entsprechende Dienstleistung aus."
+    },
+    {
+      "concept_id": "proptech",
+      "name": "PropTech",
+      "aliases": ["Property Technology", "Real Estate Technology"],
+      "definition": "Technologie für Immobilientransaktionen, Immobilienverwaltung, Gebäude und betriebliche Abläufe in der Immobilienwirtschaft.",
+      "semantic_boundary": "Schließt Bautechnologie und allgemeine Software aus, die von Immobilienunternehmen nur beiläufig genutzt wird."
+    },
+    {
+      "concept_id": "regtech",
+      "name": "RegTech",
+      "aliases": ["Regulatory Technology"],
+      "definition": "Technologie, die regulatorische und Compliance-Pflichten überwacht, interpretiert oder automatisiert.",
+      "semantic_boundary": "Schließt allgemeine Rechtssoftware und Compliance-Aussagen ohne Funktion zur regulatorischen Überwachung oder Automatisierung aus."
+    },
+    {
+      "concept_id": "robotics",
+      "name": "Robotics",
+      "aliases": ["Robotik"],
+      "definition": "Technologie für Entwicklung, Training, Steuerung oder Betrieb von Robotern und autonomen physischen Systemen.",
+      "semantic_boundary": "Schließt Softwareautomatisierung ohne physisches Robotersystem aus."
+    },
+    {
+      "concept_id": "semiconductors",
+      "name": "Semiconductors",
+      "aliases": ["Semiconductor Technology", "Halbleiter"],
+      "definition": "Technologie für Halbleitermaterialien, Wafer, Chips, Fertigung und Produktionssysteme für Halbleiter.",
+      "semantic_boundary": "Erfordert ein Halbleitermaterial, eine Halbleiterkomponente, einen Fertigungsprozess oder eine spezielle Produktionstechnologie; die beiläufige Nutzung von Chips ist ausgeschlossen."
+    },
+    {
+      "concept_id": "sustainability",
+      "name": "Sustainability",
+      "aliases": ["Nachhaltigkeit"],
+      "definition": "Produkte und Dienstleistungen, deren Hauptzweck die Verringerung von Umweltauswirkungen oder die Ermöglichung nachhaltiger Wirtschaftstätigkeit umfasst.",
+      "semantic_boundary": "Erfordert einen konkreten Nachhaltigkeitszweck; beiläufige Effizienz oder allgemeine ESG-Formulierungen allein reichen nicht aus."
+    },
+    {
+      "concept_id": "spacetech",
+      "name": "SpaceTech",
+      "aliases": ["Space Tech"],
+      "definition": "Technologie für Weltraumstarts, Satelliten, Raumfahrzeuge, orbitale Infrastruktur oder weltraumgestützte Dienstleistungen.",
+      "semantic_boundary": "Schließt Luftfahrt und allgemeine Luft- und Raumfahrtbezüge ohne Weltraumanwendung aus."
+    },
+    {
+      "concept_id": "traveltech",
+      "name": "TravelTech",
+      "aliases": ["Travel Tech"],
+      "definition": "Technologiegestützte Plattformen und Dienstleistungen für Reisesuche, Buchung, Unterkünfte, Transport und Erlebnisse.",
+      "semantic_boundary": "Schließt allgemeine Mobilitäts- und Gastgewerbebezüge ohne Reiseprodukt oder Buchungsdienstleistung aus."
+    }
+  ]
+}

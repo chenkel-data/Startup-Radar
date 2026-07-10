@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +30,8 @@ class Settings(BaseSettings):
 
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
+    openai_temperature: float = Field(default=0.0, alias="OPENAI_TEMPERATURE", ge=0, le=2)
+    openai_seed: int | None = Field(default=42, alias="OPENAI_SEED")
     openai_max_retries: int = Field(default=0, alias="OPENAI_MAX_RETRIES", ge=0, le=5)
     llm_max_concurrency: int = Field(default=3, alias="LLM_MAX_CONCURRENCY", ge=1, le=20)
     llm_timeout_seconds: int = Field(default=45, alias="LLM_TIMEOUT_SECONDS", ge=5)
@@ -81,13 +83,19 @@ class Settings(BaseSettings):
     )
 
     scrape_timeout_seconds: int = Field(default=20, alias="SCRAPE_TIMEOUT_SECONDS", ge=5)
-    max_articles_per_ingest: int = Field(default=150, alias="MAX_ARTICLES_PER_INGEST", ge=1)
     model_config = SettingsConfigDict(
         env_file=(PROJECT_ROOT / ".env", BACKEND_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
     )
+
+    @field_validator("openai_seed", mode="before")
+    @classmethod
+    def empty_seed_disables_seed(cls, value):
+        if isinstance(value, str) and value.strip().casefold() in {"", "none", "null"}:
+            return None
+        return value
 
 
 @lru_cache

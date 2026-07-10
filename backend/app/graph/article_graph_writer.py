@@ -33,6 +33,20 @@ class ArticleGraphWriter:
     def __init__(self, neo4j: Neo4jClient):
         self.neo4j = neo4j
 
+    async def cached_article_urls_for_extraction_policy(
+        self,
+        urls: list[str],
+        article_extraction_policy_hash: str,
+    ) -> set[str]:
+        if not urls or not article_extraction_policy_hash:
+            return set()
+        async with self.neo4j.session() as session:
+            return await session.execute_read(
+                cached_article_urls_for_extraction_policy_tx,
+                urls,
+                article_extraction_policy_hash,
+            )
+
     async def ingest_article_bundle(
         self,
         article: ArticleIn,
@@ -45,6 +59,9 @@ class ArticleGraphWriter:
         mlflow_experiment_id: str | None = None,
         job_run_id: str | None = None,
         processed_at: str | None = None,
+        article_extraction_policy_hash: str | None = None,
+        article_extraction_policy: dict[str, Any] | None = None,
+        profile_curation_policy_hash: str | None = None,
     ) -> int:
         async with self.neo4j.session() as session:
             return await session.execute_write(
@@ -58,6 +75,9 @@ class ArticleGraphWriter:
                 mlflow_experiment_id,
                 job_run_id,
                 processed_at,
+                article_extraction_policy_hash,
+                article_extraction_policy,
+                profile_curation_policy_hash,
             )
 
 
@@ -72,6 +92,9 @@ async def ingest_article_tx(
     mlflow_experiment_id: str | None = None,
     job_run_id: str | None = None,
     processed_at: str | None = None,
+    article_extraction_policy_hash: str | None = None,
+    article_extraction_policy: dict[str, Any] | None = None,
+    profile_curation_policy_hash: str | None = None,
 ) -> int:
     op_count = 0
     source_id = f"source:{NameNormalizer.slug(article.source_name)}"
@@ -106,6 +129,10 @@ async def ingest_article_tx(
         ON CREATE SET a.created_at = datetime()
         SET a.updated_at = datetime(),
             a.url = $url,
+            a.url_aliases = reduce(
+              aliases = coalesce(a.url_aliases, []), alias IN $url_aliases |
+                CASE WHEN alias IN aliases THEN aliases ELSE aliases + [alias] END
+            ),
             a.title = $title,
             a.summary = $summary,
             a.text = $text,
@@ -114,6 +141,8 @@ async def ingest_article_tx(
             a.source_url = $source_url,
             a.published_at = $published_at,
             a.tags = $tags,
+            a.primary_type = $primary_type,
+            a.cleaning_report = $cleaning_report,
             a.trace_id = CASE
               WHEN $trace_id IS NULL OR $trace_id = "" THEN a.trace_id ELSE $trace_id
             END,
@@ -127,23 +156,44 @@ async def ingest_article_tx(
               WHEN $provenance IN coalesce(a.trace_provenance, []) THEN a.trace_provenance
               ELSE coalesce(a.trace_provenance, []) + [$provenance]
             END,
-            a.raw_extracted_entities = $raw_extracted_entities
+            a.raw_extracted_entities = $raw_extracted_entities,
+            a.article_extraction_policy_hash = CASE
+              WHEN $article_extraction_policy_hash IS NULL OR $article_extraction_policy_hash = ""
+                THEN a.article_extraction_policy_hash
+              ELSE $article_extraction_policy_hash
+            END,
+            a.article_extraction_policy = CASE
+              WHEN $article_extraction_policy IS NULL OR $article_extraction_policy = ""
+                THEN a.article_extraction_policy
+              ELSE $article_extraction_policy
+            END
         """,
         id=article_id,
         url=article.url,
+        url_aliases=list(
+            dict.fromkeys(url for url in (article.url, article.discovered_url) if url)
+        ),
         title=article.title,
         summary=article.summary,
-        text=article.text[:20000],
+        text=article.text,
         author=article.author,
         source_name=article.source_name,
         source_url=article.source_url,
         published_at=article.published_at,
         tags=article.tags,
+        primary_type=article.primary_type,
+        cleaning_report=(
+            json.dumps(article.cleaning.model_dump(mode="json"), ensure_ascii=False)
+            if article.cleaning
+            else None
+        ),
         trace_id=trace_id,
         mlflow_trace_url=mlflow_trace_url,
         mlflow_experiment_id=mlflow_experiment_id,
         provenance=article_provenance,
         raw_extracted_entities=raw_extracted_entities_json(raw_extracted_entities, extraction),
+        article_extraction_policy_hash=article_extraction_policy_hash,
+        article_extraction_policy=article_extraction_policy_json(article_extraction_policy),
     )
     await relate_tx(
         tx,
@@ -209,6 +259,7 @@ async def ingest_article_tx(
                 job_run_id=job_run_id,
                 processed_at=processed_at,
                 evidence_status=extracted_entity.evidence_status,
+                profile_curation_policy_hash=profile_curation_policy_hash,
             )
             op_count += 1
 
@@ -278,6 +329,27 @@ async def ingest_article_tx(
     return op_count
 
 
+async def cached_article_urls_for_extraction_policy_tx(
+    tx,
+    urls: list[str],
+    article_extraction_policy_hash: str,
+) -> set[str]:
+    result = await tx.run(
+        """
+        UNWIND $urls AS requested_url
+        MATCH (a:Article)
+        WHERE (a.url = requested_url OR requested_url IN coalesce(a.url_aliases, []))
+          AND a.article_extraction_policy_hash = $article_extraction_policy_hash
+          AND coalesce(a.raw_extracted_entities, "") <> ""
+        RETURN DISTINCT requested_url AS url
+        """,
+        urls=urls,
+        article_extraction_policy_hash=article_extraction_policy_hash,
+    )
+    rows = await result.data()
+    return {str(row["url"]) for row in rows if row.get("url")}
+
+
 def provenance_json(
     *,
     article: ArticleIn,
@@ -317,6 +389,21 @@ async def upsert_entity_tx(
     descriptions: list[str] | None = None,
     embedding: list[float] | None = None,
 ) -> None:
+    if entity.label in {"Startup", "Investor", "Company"}:
+        # Keep the ID and attached relationships stable if stronger identity
+        # evidence changes the canonical organization label.
+        new_label = safe_label(entity.label)
+        old_labels = sorted({"Startup", "Investor", "Company"} - {entity.label})
+        remove_clause = ":".join(old_labels)
+        await tx.run(
+            f"""
+            MATCH (n {{id: $id}})
+            WHERE any(label IN labels(n) WHERE label IN ["Startup", "Investor", "Company"])
+            SET n:{new_label}
+            REMOVE n:{remove_clause}
+            """,
+            id=entity.id,
+        )
     label = safe_label(entity.label)
     query = f"""
     MERGE (n:{label} {{id: $id}})
@@ -324,7 +411,23 @@ async def upsert_entity_tx(
     SET n.updated_at = datetime(),
         n.name = $name,
         n.canonical_name = $canonical_name,
+        n.primary_type_basis = $primary_type_basis,
+        n.observed_types = $observed_types,
+        n.type_conflict = $type_conflict,
+        n.concept_id = CASE
+          WHEN $concept_id IS NULL THEN n.concept_id ELSE $concept_id
+        END,
+        n.ontology_version = CASE
+          WHEN $ontology_version IS NULL THEN n.ontology_version ELSE $ontology_version
+        END,
+        n.ontology_hash = CASE
+          WHEN $ontology_hash IS NULL THEN n.ontology_hash ELSE $ontology_hash
+        END,
+        n.semantic_boundary = CASE
+          WHEN $semantic_boundary IS NULL THEN n.semantic_boundary ELSE $semantic_boundary
+        END,
         n.aliases = CASE
+          WHEN $concept_id IS NOT NULL THEN $aliases
           WHEN n.aliases IS NULL THEN $aliases
           ELSE reduce(acc = n.aliases, alias IN $aliases |
             CASE WHEN alias IN acc THEN acc ELSE acc + [alias] END)
@@ -335,6 +438,7 @@ async def upsert_entity_tx(
           ELSE n.evidence_status
         END,
         n.description = CASE
+          WHEN $concept_id IS NOT NULL THEN $description
           WHEN n.description_source IN ["curated_llm", "reviewed_llm"] THEN n.description
           WHEN $description IS NULL OR $description = "" THEN n.description
           WHEN n.description IS NULL OR n.description = "" OR n.evidence_status IS NULL THEN $description
@@ -342,6 +446,7 @@ async def upsert_entity_tx(
           ELSE n.description
         END,
         n.description_source = CASE
+          WHEN $concept_id IS NOT NULL THEN "topic_ontology"
           WHEN n.description_source IN ["curated_llm", "reviewed_llm"] THEN n.description_source
           WHEN $description IS NULL OR $description = "" THEN n.description_source
           ELSE coalesce(n.description_source, "extraction")
@@ -358,6 +463,13 @@ async def upsert_entity_tx(
         id=entity.id,
         name=entity.name,
         canonical_name=entity.canonical_name,
+        primary_type_basis=entity.primary_type_basis,
+        observed_types=entity.observed_types,
+        type_conflict=entity.type_conflict,
+        concept_id=entity.concept_id,
+        ontology_version=entity.ontology_version,
+        ontology_hash=entity.ontology_hash,
+        semantic_boundary=entity.semantic_boundary,
         aliases=entity.aliases,
         evidence_status=entity.evidence_status,
         description=entity.description,
@@ -614,7 +726,7 @@ def extracted_entity_groups(
 
 
 def entity_article_evidence(entity: ExtractedEntity) -> str | None:
-    evidence = (entity.source.evidence or entity.description or "").strip()
+    evidence = (entity.source.evidence or "").strip()
     if not evidence:
         return None
     return evidence[:EVIDENCE_MAX_CHARS]
@@ -650,3 +762,15 @@ def raw_extracted_entities_json(
         )
     }
     return json.dumps(entity_payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def article_extraction_policy_json(policy: dict[str, Any] | None) -> str | None:
+    if not policy:
+        return None
+    return json.dumps(
+        policy,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )

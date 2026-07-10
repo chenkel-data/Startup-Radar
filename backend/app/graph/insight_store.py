@@ -31,7 +31,7 @@ class InsightStore:
         query = """
         MATCH (i)-[r:INVESTED_IN]->(target)
         WHERE (i:Investor OR i:Company OR i:Person)
-          AND target:Startup
+          AND (target:Startup OR target:Investor OR target:Company)
           AND coalesce(r.lifecycle_status, "supported") = "supported"
           AND coalesce(r.review_status, "unreviewed") IN ["unreviewed", "accepted"]
         RETURN i.id AS id,
@@ -53,9 +53,10 @@ class InsightStore:
 
     async def co_investments(self, limit: int = 20) -> list[dict[str, Any]]:
         query = """
-        MATCH (i1)-[r1:INVESTED_IN]->(s:Startup)<-[r2:INVESTED_IN]-(i2)
+        MATCH (i1)-[r1:INVESTED_IN]->(organization)<-[r2:INVESTED_IN]-(i2)
         WHERE (i1:Investor OR i1:Company OR i1:Person)
           AND (i2:Investor OR i2:Company OR i2:Person)
+          AND (organization:Startup OR organization:Investor OR organization:Company)
           AND i1.id < i2.id
           AND coalesce(r1.lifecycle_status, "supported") = "supported"
           AND coalesce(r2.lifecycle_status, "supported") = "supported"
@@ -77,10 +78,10 @@ class InsightStore:
                  WHEN i2:Person THEN "Person"
                  ELSE head(labels(i2))
                END AS target_type,
-               count(DISTINCT s) AS shared_startups,
-               count(DISTINCT s) AS rounds,
-               collect(DISTINCT s.name)[0..5] AS examples
-        ORDER BY shared_startups DESC, source ASC, target ASC
+               count(DISTINCT organization) AS shared_organizations,
+               count(DISTINCT organization) AS rounds,
+               collect(DISTINCT organization.name)[0..5] AS examples
+        ORDER BY shared_organizations DESC, source ASC, target ASC
         LIMIT $limit
         """
         async with self.neo4j.session() as session:

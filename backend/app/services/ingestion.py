@@ -8,7 +8,7 @@ Pipeline shape
 3. Each article then flows through `_process_article`, decorated with
    `@mlflow.trace`. That is the trace **root** for the article, and the
    tree below it captures the whole pipeline (extract → filter → resolve
-   → write → curate touched entity profiles).
+   → write).
 4. Per-article OpenAI calls auto-instrument as `CHAT_MODEL` spans
    thanks to `mlflow.openai.autolog()`.
 
@@ -23,6 +23,7 @@ behind a per-job `_resolver_lock`. Extraction still runs in parallel.
 from __future__ import annotations
 
 import asyncio
+import json
 from time import perf_counter
 from typing import Any
 
@@ -42,6 +43,7 @@ from app.models.extraction import (
     IngestRequest,
     IngestStats,
     NormalizedEntity,
+    SourceAttribution,
     strongest_evidence_status,
 )
 from app.observability import IngestionRun, RunHandle
@@ -53,17 +55,15 @@ from app.observability.artifacts import (
 )
 from app.observability.scorers import attach_extraction_scores
 from app.observability.traces import mlflow_trace_link
+from app.prompts.extraction import article_prompt_audit, build_article_prompt_input
 from app.graph.article_graph_writer import ArticleGraphWriter
 from app.graph.entity_resolution_store import EntityResolutionStore
 from app.services.embedding import EmbeddingService
-from app.services.entity_curation import EntityProfileCurationService
 from app.services.entity_resolution import EntityResolver, NameNormalizer, ResolutionOutcome
 from app.services.llm import LLMExtractionService, MISSING_OPENAI_API_KEY_MESSAGE
 from app.services.progress import article_fields
 from app.services.scraper import ArticleScraper
-
-
-_MAX_EVIDENCE_CHARS = 320
+from app.topic_ontology import TopicOntologyReport, get_topic_ontology
 
 
 class _ArticleResult:
@@ -76,7 +76,7 @@ class _ArticleResult:
         "graph_row",
         "outcome_rows",
         "extraction_dump",
-        "curation_rows",
+        "topic_ontology_report",
         "failure_row",
         "input_tokens",
         "output_tokens",
@@ -90,7 +90,7 @@ class _ArticleResult:
         self.graph_row: dict[str, Any] = {}
         self.outcome_rows: list[dict[str, Any]] = []
         self.extraction_dump: dict[str, Any] | None = None
-        self.curation_rows: list[dict[str, Any]] = []
+        self.topic_ontology_report: dict[str, Any] = {}
         self.failure_row: dict[str, Any] | None = None
         self.input_tokens: int = 0
         self.output_tokens: int = 0
@@ -107,7 +107,7 @@ class IngestionService:
         article_writer: ArticleGraphWriter,
         resolution_store: EntityResolutionStore,
         embedding: EmbeddingService | None = None,
-        profile_curation: EntityProfileCurationService | None = None,
+        profile_curation_policy_hash: str | None = None,
     ):
         self.settings = settings
         self.scraper = scraper
@@ -115,7 +115,8 @@ class IngestionService:
         self.article_writer = article_writer
         self.resolution_store = resolution_store
         self.embedding = embedding
-        self.profile_curation = profile_curation
+        self.profile_curation_policy_hash = profile_curation_policy_hash
+        self.topic_ontology = get_topic_ontology()
         self.logger = get_logger("ingestion")
         # Resolver state and Neo4j writes are not thread-safe; serialize the
         # post-extraction phase per ingestion. Extraction itself still runs
@@ -131,22 +132,31 @@ class IngestionService:
         if not self.settings.openai_api_key:
             raise RuntimeError(MISSING_OPENAI_API_KEY_MESSAGE)
 
+        self.llm.pop_openai_rate_limit_stats()
         started = perf_counter()
         stats = IngestStats(source_name=request.source_name)
         run_id = ingest_run_id or "no-task-id"
+        article_extraction_policy = self.llm.article_extraction_policy()
+        article_extraction_policy_hash = self.llm.article_extraction_policy_hash()
+        stats.article_extraction_policy_hash = article_extraction_policy_hash
 
-        run_params = self._build_run_params(request)
+        run_params = self._build_run_params(request, article_extraction_policy_hash)
         run_tags = self._build_run_tags(request)
+        article_action = (
+            "reprocess every article"
+            if request.force_rescrape
+            else "skip articles processed before"
+        )
 
         async with timed_step(
             self.logger,
             "ingestion",
             workflow_step="ingest",
+            task_id=run_id,
             url=str(request.source_url),
-            count=request.max_pages,
-            detail=(
-                f"source={request.source_name}; include_feed={request.include_feed}; "
-                f"paths={len(request.paths)}; ingest_run_id={run_id}"
+            start_summary=(
+                f"Starting ingestion for {request.source_name}: collect article links, "
+                f"{article_action}, extract entities, and update the graph."
             ),
         ):
             async with IngestionRun(
@@ -155,13 +165,23 @@ class IngestionService:
                 params=run_params,
                 tags=run_tags,
             ) as ingest_run:
-                articles = await self._scrape_stage(request, stats, ingest_run)
-                resolver = await self._registry_stage(ingest_run)
-                results = await self._dispatch_articles(
-                    articles=articles,
-                    resolver=resolver,
-                    job_run_id=run_id,
+                articles = await self._scrape_stage(
+                    request,
+                    stats,
+                    ingest_run,
+                    article_extraction_policy_hash=article_extraction_policy_hash,
                 )
+                if articles:
+                    resolver = await self._registry_stage(ingest_run)
+                    results = await self._dispatch_articles(
+                        articles=articles,
+                        resolver=resolver,
+                        job_run_id=run_id,
+                        article_extraction_policy_hash=article_extraction_policy_hash,
+                        article_extraction_policy=article_extraction_policy,
+                    )
+                else:
+                    results = []
                 self._tally(results, stats)
                 self._finalize_run(
                     ingest_run=ingest_run,
@@ -171,19 +191,31 @@ class IngestionService:
                 )
 
         stats.duration_ms = round((perf_counter() - started) * 1000, 2)
+        fetch_failures = self._article_fetch_failure_count(stats)
+        total_failures = fetch_failures + stats.articles_failed
         self.logger.info(
             "ingest_completed",
             extra={
                 "event": "ingestion",
                 "workflow_step": "ingest",
-                "count": stats.articles_processed,
-                "failed_count": stats.articles_failed,
+                "task_id": run_id,
+                "url": str(request.source_url),
                 "duration_ms": stats.duration_ms,
-                "detail": (
-                    f"found={stats.articles_found}, processed={stats.articles_processed}, "
-                    f"failed={stats.articles_failed}, entities={stats.entities_extracted}, "
-                    f"relationships={stats.relationships_created}"
+                "summary": (
+                    f"Finished {request.source_name}: {stats.articles_scraped} fetched, "
+                    f"{stats.articles_skipped} skipped (already processed), "
+                    f"{stats.articles_processed} processed, {total_failures} failed; "
+                    f"{stats.entities_extracted} entities, "
+                    f"{stats.relationships_created} graph operations."
                 ),
+                "article_links_selected": stats.articles_found,
+                "articles_skipped_as_processed": stats.articles_cached,
+                "articles_fetched": stats.articles_scraped,
+                "articles_failed_or_invalid": fetch_failures,
+                "articles_processed": stats.articles_processed,
+                "articles_processing_failed": stats.articles_failed,
+                "entities_extracted": stats.entities_extracted,
+                "graph_operations": stats.relationships_created,
             },
         )
         return stats
@@ -192,14 +224,22 @@ class IngestionService:
     # Run-level helpers
     # ------------------------------------------------------------------
 
-    def _build_run_params(self, request: IngestRequest) -> dict[str, Any]:
+    def _build_run_params(
+        self,
+        request: IngestRequest,
+        article_extraction_policy_hash: str,
+    ) -> dict[str, Any]:
+        ontology = getattr(self, "topic_ontology", None) or get_topic_ontology()
         return {
             "max_pages": request.max_pages,
             "source_name": request.source_name,
             "source_url": str(request.source_url),
             "include_feed": request.include_feed,
+            "force_rescrape": request.force_rescrape,
             "paths_count": len(request.paths),
             "openai_model": self.settings.openai_model,
+            "openai_temperature": self.settings.openai_temperature,
+            "openai_seed": self.settings.openai_seed,
             "admission_policy": "evidence_status:stated|attributed",
             "embedding_model": self.settings.embedding_model,
             "embedding_similarity_threshold": self.settings.embedding_similarity_threshold,
@@ -216,25 +256,76 @@ class IngestionService:
             "prompt_profile_review_uri": self.settings.mlflow_prompt_profile_review_uri,
             "prompt_profile_curation_uri": (self.settings.mlflow_prompt_profile_curation_uri),
             "use_prompt_registry": self.settings.mlflow_use_prompt_registry,
+            "article_extraction_policy_hash": article_extraction_policy_hash,
+            "profile_curation_policy_hash": self.profile_curation_policy_hash,
+            "topic_ontology_version": ontology.ontology_version,
+            "topic_ontology_hash": ontology.content_hash,
+            "topic_ontology_mode": "closed_exact_aliases",
             "app_env": self.settings.app_env,
             "git_sha": self.settings.git_sha,
             "app_version": self.settings.app_version,
         }
 
     def _build_run_tags(self, request: IngestRequest) -> dict[str, str]:
+        ontology = getattr(self, "topic_ontology", None) or get_topic_ontology()
         return {
             "env": self.settings.app_env,
             "git_sha": self.settings.git_sha,
             "app_version": self.settings.app_version,
             "source_name": request.source_name,
             "model": self.settings.openai_model,
+            "topic_ontology_version": ontology.ontology_version,
         }
+
+    @staticmethod
+    def _article_count(count: int) -> str:
+        noun = "article" if count == 1 else "articles"
+        return f"{count} {noun}"
+
+    @staticmethod
+    def _article_link_count(count: int) -> str:
+        noun = "article link" if count == 1 else "article links"
+        return f"{count} {noun}"
+
+    @staticmethod
+    def _article_fetch_failure_count(stats: IngestStats) -> int:
+        return max(
+            stats.articles_found - stats.articles_skipped - stats.articles_scraped,
+            0,
+        )
+
+    def _article_collection_summary(self, stats: IngestStats) -> str:
+        return (
+            f"{stats.articles_found} links: {stats.articles_scraped} fetched, "
+            f"{stats.articles_skipped} skipped, "
+            f"{self._article_fetch_failure_count(stats)} failed."
+        )
+
+    def _article_cache_summary(
+        self,
+        *,
+        found_count: int,
+        cached_count: int,
+        fetch_count: int,
+        force_rescrape: bool,
+    ) -> str:
+        if found_count == 0:
+            return "No links found."
+        if force_rescrape:
+            return f"{found_count} links: force re-scrape, fetching {fetch_count}."
+        return f"{found_count} links: {cached_count} already processed, fetching {fetch_count}."
+
+    def _article_cache_all_cached_message(self, found_count: int) -> str:
+        found = self._article_count(found_count)
+        return f"All {found} were already processed."
 
     async def _scrape_stage(
         self,
         request: IngestRequest,
         stats: IngestStats,
         ingest_run: RunHandle,
+        *,
+        article_extraction_policy_hash: str,
     ) -> list[ArticleIn]:
         stage_started = perf_counter()
         self.logger.info(
@@ -243,31 +334,112 @@ class IngestionService:
                 "event": "ingestion",
                 "workflow_step": "scraping",
                 "url": str(request.source_url),
-                "detail": "collecting article links and article text",
+                "summary": f"Collecting article links from {request.source_name}.",
             },
         )
-        articles = await self.scraper.collect(
+        links = await self.scraper.collect_links(
             source_url=str(request.source_url),
             source_name=request.source_name,
             max_pages=request.max_pages,
             include_feed=request.include_feed,
             paths=request.paths,
         )
-        stats.articles_found = len(articles)
+        stats.articles_found = len(links)
+
+        cached_links: set[str] = set()
+        cache_lookup_failed = False
+        if not request.force_rescrape and links:
+            cached_links, cache_lookup_failed = await self._cached_article_links(
+                links,
+                article_extraction_policy_hash,
+            )
+
+        if request.force_rescrape:
+            links_to_fetch = links
+        else:
+            links_to_fetch = [link for link in links if link not in cached_links]
+        stats.articles_cached = len(cached_links)
+        stats.articles_skipped = 0 if request.force_rescrape else len(cached_links)
+
+        if not cache_lookup_failed:
+            self.logger.info(
+                "article_extraction_cache_checked",
+                extra={
+                    "event": "scraping",
+                    "workflow_step": "article_cache",
+                    "summary": self._article_cache_summary(
+                        found_count=len(links),
+                        cached_count=len(cached_links),
+                        fetch_count=len(links_to_fetch),
+                        force_rescrape=request.force_rescrape,
+                    ),
+                    "article_links_selected": len(links),
+                    "articles_skipped_as_processed": len(cached_links),
+                    "articles_to_fetch": len(links_to_fetch),
+                },
+            )
+
+        if links and not links_to_fetch:
+            stats.cache_message = self._article_cache_all_cached_message(stats.articles_found)
+            articles = []
+        elif links_to_fetch:
+            articles = await self.scraper.fetch_articles(
+                source_url=str(request.source_url),
+                source_name=request.source_name,
+                links=links_to_fetch,
+            )
+        else:
+            articles = []
+
+        stats.articles_scraped = len(articles)
         duration_ms = round((perf_counter() - stage_started) * 1000, 2)
         ingest_run.record_metric("scrape_duration_ms", duration_ms)
         ingest_run.record_metric("articles_found", float(stats.articles_found))
+        ingest_run.record_metric("articles_cached", float(stats.articles_cached))
+        ingest_run.record_metric("articles_scraped", float(stats.articles_scraped))
+        ingest_run.record_metric("articles_skipped", float(stats.articles_skipped))
         self.logger.info(
             "workflow_stage_completed",
             extra={
                 "event": "ingestion",
                 "workflow_step": "scraping",
                 "url": str(request.source_url),
-                "count": stats.articles_found,
-                "detail": f"articles_ready={stats.articles_found}",
+                "duration_ms": duration_ms,
+                "summary": self._article_collection_summary(stats),
+                "article_links_selected": stats.articles_found,
+                "articles_skipped_as_processed": stats.articles_cached,
+                "articles_fetched": stats.articles_scraped,
+                "articles_failed_or_invalid": self._article_fetch_failure_count(stats),
             },
         )
         return articles
+
+    async def _cached_article_links(
+        self,
+        links: list[str],
+        article_extraction_policy_hash: str,
+    ) -> tuple[set[str], bool]:
+        try:
+            cached_links = await self.article_writer.cached_article_urls_for_extraction_policy(
+                links,
+                article_extraction_policy_hash,
+            )
+            return cached_links, False
+        except Exception as exc:
+            self.logger.warning(
+                "article_extraction_cache_lookup_failed",
+                extra={
+                    "event": "scraping",
+                    "workflow_step": "article_cache",
+                    "article_links_found": len(links),
+                    "error": str(exc),
+                    "summary": (
+                        "Could not check which articles were already processed; fetching all "
+                        f"{self._article_link_count(len(links))}."
+                    ),
+                },
+            )
+            return set(), True
 
     async def _registry_stage(self, ingest_run: RunHandle) -> EntityResolver:
         stage_started = perf_counter()
@@ -276,7 +448,7 @@ class IngestionService:
             extra={
                 "event": "ingestion",
                 "workflow_step": "resolution_registry",
-                "detail": "loading existing graph entities and aliases",
+                "summary": "Loading existing graph entities and aliases for matching.",
             },
         )
         resolver = EntityResolver(self.settings, self.embedding, self.resolution_store)
@@ -290,7 +462,11 @@ class IngestionService:
             extra={
                 "event": "ingestion",
                 "workflow_step": "resolution_registry",
-                "detail": f"entity registry ready (size={registry_size})",
+                "duration_ms": duration_ms,
+                "summary": (
+                    f"Loaded {registry_size} existing entities and their aliases for matching."
+                ),
+                "registry_size": registry_size,
             },
         )
         return resolver
@@ -301,6 +477,8 @@ class IngestionService:
         articles: list[ArticleIn],
         resolver: EntityResolver,
         job_run_id: str,
+        article_extraction_policy_hash: str,
+        article_extraction_policy: dict[str, Any],
     ) -> list[_ArticleResult]:
         if not articles:
             return []
@@ -311,6 +489,8 @@ class IngestionService:
                     article=article,
                     resolver=resolver,
                     job_run_id=job_run_id,
+                    article_extraction_policy_hash=article_extraction_policy_hash,
+                    article_extraction_policy=article_extraction_policy,
                     article_index=index,
                     article_total=total,
                 )
@@ -325,6 +505,16 @@ class IngestionService:
                 stats.articles_processed += 1
                 stats.entities_extracted += int(result.graph_row.get("entity_count", 0) or 0)
                 stats.relationships_created += int(result.graph_row.get("graph_operations", 0) or 0)
+                stats.topic_candidates += int(
+                    result.topic_ontology_report.get("topic_candidates", 0) or 0
+                )
+                stats.topics_kept += int(result.topic_ontology_report.get("topics_kept", 0) or 0)
+                stats.topics_rejected += int(
+                    result.topic_ontology_report.get("topics_rejected", 0) or 0
+                )
+                stats.has_topic_relationships_rejected += int(
+                    result.topic_ontology_report.get("has_topic_rejected", 0) or 0
+                )
             else:
                 stats.articles_failed += 1
 
@@ -343,7 +533,7 @@ class IngestionService:
         failure_rows: list[dict[str, Any]] = []
         graph_rows: list[dict[str, Any]] = []
         extraction_dumps: list[dict[str, Any]] = []
-        curation_rows: list[dict[str, Any]] = []
+        topic_rejection_rows: list[dict[str, Any]] = []
         fallback_input_tokens = 0
         fallback_output_tokens = 0
 
@@ -358,7 +548,22 @@ class IngestionService:
                 graph_rows.append(result.graph_row)
                 if result.extraction_dump:
                     extraction_dumps.append(result.extraction_dump)
-                curation_rows.extend(result.curation_rows)
+                for rejection in result.topic_ontology_report.get("rejections", []):
+                    topic_rejection_rows.append(
+                        {
+                            "article_url": (
+                                result.article.url if result.article is not None else None
+                            ),
+                            "article_title": (
+                                result.article.title if result.article is not None else None
+                            ),
+                            "ontology_version": result.topic_ontology_report.get(
+                                "ontology_version"
+                            ),
+                            "ontology_hash": result.topic_ontology_report.get("ontology_hash"),
+                            **rejection,
+                        }
+                    )
                 fallback_input_tokens += result.input_tokens
                 fallback_output_tokens += result.output_tokens
             elif result.failure_row:
@@ -384,10 +589,18 @@ class IngestionService:
             int(row.get("attempts") or 0) for row in extraction_rows if row.get("attempts")
         ]
         metrics: dict[str, float] = {
+            "articles_found": float(stats.articles_found),
+            "articles_cached": float(stats.articles_cached),
+            "articles_scraped": float(stats.articles_scraped),
+            "articles_skipped": float(stats.articles_skipped),
             "articles_processed": float(stats.articles_processed),
             "articles_failed": float(stats.articles_failed),
             "entities_extracted": float(stats.entities_extracted),
             "relationships_created": float(stats.relationships_created),
+            "topic_candidates": float(stats.topic_candidates),
+            "topics_kept": float(stats.topics_kept),
+            "topics_rejected": float(stats.topics_rejected),
+            "has_topic_relationships_rejected": float(stats.has_topic_relationships_rejected),
             "duration_ms": duration_ms,
             "resolved_exact": float(method_totals["exact"]),
             "resolved_fuzzy": float(method_totals["fuzzy"]),
@@ -436,29 +649,15 @@ class IngestionService:
                 / total_outcomes,
                 4,
             )
-        if curation_rows:
-            metrics["entity_profiles_reviewed"] = float(
-                sum(
-                    1
-                    for row in curation_rows
-                    if row.get("status") in {"kept", "updated", "needs_human_review"}
-                )
-            )
-            metrics["entity_profiles_kept"] = float(
-                sum(1 for row in curation_rows if row.get("status") == "kept")
-            )
-            metrics["entity_profiles_curated"] = float(
-                sum(1 for row in curation_rows if row.get("status") == "updated")
-            )
-            metrics["entity_profiles_failed"] = float(
-                sum(1 for row in curation_rows if row.get("status") == "failed")
-            )
-            metrics["entity_profiles_needing_human_review"] = float(
-                sum(1 for row in curation_rows if row.get("status") == "needs_human_review")
-            )
-            metrics["entity_profile_embeddings_updated"] = float(
-                sum(1 for row in curation_rows if row.get("embedding_updated"))
-            )
+        rate_limit_stats = self.llm.pop_openai_rate_limit_stats()
+        metrics.update(
+            {
+                "openai_rate_limit_events": rate_limit_stats["events"],
+                "openai_rate_limit_retries": rate_limit_stats["retries"],
+                "openai_rate_limit_failures": rate_limit_stats["failures"],
+                "openai_rate_limit_wait_seconds": rate_limit_stats["wait_seconds"],
+            }
+        )
         if llm_cost_rows:
             cost_metrics = llm_cost_metrics(llm_cost_rows)
             metrics.update(cost_metrics)
@@ -475,6 +674,7 @@ class IngestionService:
                     6,
                 )
         ingest_run.record_metrics(metrics)
+        self._log_rate_limit_summary(rate_limit_stats)
 
         if extraction_rows:
             ingest_run.add_jsonl_artifact("extraction_summary.jsonl", extraction_rows)
@@ -482,17 +682,17 @@ class IngestionService:
             ingest_run.add_jsonl_artifact("graph_ops.jsonl", graph_rows)
         if extraction_dumps:
             ingest_run.add_jsonl_artifact("extraction_dump.jsonl", extraction_dumps)
+        if topic_rejection_rows:
+            ingest_run.add_jsonl_artifact(
+                "topic_ontology_rejections.jsonl",
+                topic_rejection_rows,
+            )
         if failure_rows:
             ingest_run.add_jsonl_artifact("failed_articles.jsonl", failure_rows)
         if outcome_rows:
             ingest_run.add_json_artifact(
                 "dedup_report.json",
                 build_dedup_report(outcome_rows=outcome_rows),
-            )
-        if curation_rows:
-            ingest_run.add_jsonl_artifact(
-                "entity_description_curation.jsonl",
-                curation_rows,
             )
         if llm_cost_rows:
             ingest_run.add_jsonl_artifact("llm_costs.jsonl", llm_cost_rows)
@@ -507,6 +707,23 @@ class IngestionService:
             ),
         )
 
+    def _log_rate_limit_summary(self, stats: dict[str, float]) -> None:
+        detail = (
+            f"events={int(stats['events'])}, retries={int(stats['retries'])}, "
+            f"failures={int(stats['failures'])}, wait_seconds={stats['wait_seconds']}"
+        )
+        self.logger.info(
+            "openai_rate_limit_summary",
+            extra={
+                "event": "ingestion",
+                "workflow_step": "ingest",
+                "count": int(stats["events"]),
+                "failed_count": int(stats["failures"]),
+                "retry_delay_seconds": stats["wait_seconds"],
+                "detail": detail,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Per-article trace root
     # ------------------------------------------------------------------
@@ -518,12 +735,17 @@ class IngestionService:
         article: ArticleIn,
         resolver: EntityResolver,
         job_run_id: str,
+        article_extraction_policy_hash: str,
+        article_extraction_policy: dict[str, Any],
         article_index: int,
         article_total: int,
     ) -> _ArticleResult:
         result = _ArticleResult()
         result.article = article
         stage_started = perf_counter()
+        cleaning_payload = article.cleaning.model_dump(mode="json") if article.cleaning else None
+        prompt_input = build_article_prompt_input(article)
+        prompt_audit = article_prompt_audit(article)
 
         mlflow.update_current_trace(
             tags={
@@ -549,16 +771,35 @@ class IngestionService:
                             article.published_at.isoformat() if article.published_at else None
                         ),
                         "tags": list(article.tags),
+                        "primary_type": article.primary_type,
+                        "prompt_input": prompt_input,
+                        **prompt_audit,
+                        "cleaning": cleaning_payload,
                     }
                 )
-                span.set_attributes(
-                    {
-                        "article_url": article.url,
-                        "source_name": article.source_name,
-                        "text_chars": len(article.text),
-                        "tag_count": len(article.tags),
-                    }
-                )
+                attributes: dict[str, Any] = {
+                    "article_url": article.url,
+                    "source_name": article.source_name,
+                    "text_chars": len(article.text),
+                    "tag_count": len(article.tags),
+                    "primary_type": article.primary_type or "unknown",
+                    **prompt_audit,
+                }
+                if article.cleaning:
+                    attributes.update(
+                        {
+                            "content_container": article.cleaning.selected_container,
+                            "content_blocks_before": article.cleaning.blocks_before,
+                            "content_blocks_after": article.cleaning.blocks_after,
+                            "content_chars_before": article.cleaning.text_chars_before,
+                            "content_chars_after": article.cleaning.text_chars_after,
+                            "content_removed_blocks": len(article.cleaning.removed_blocks),
+                            "content_remaining_promotion_markers": len(
+                                article.cleaning.remaining_promotion_markers
+                            ),
+                        }
+                    )
+                span.set_attributes(attributes)
             except Exception:  # pragma: no cover
                 pass
 
@@ -604,11 +845,21 @@ class IngestionService:
         raw_status_counts = _evidence_status_counts(extraction)
         pre_filter_count = extraction.entity_count()
         cleaned = self._filter_by_evidence_traced(extraction)
+        topic_report = self._enforce_topic_ontology_traced(article, cleaned)
+        topic_report_payload = topic_report.to_dict()
+        result.topic_ontology_report = topic_report_payload
 
         if span is not None:
             try:
                 span.set_attribute("entity_count_pre_filter", pre_filter_count)
                 span.set_attribute("entity_count_post_filter", cleaned.entity_count())
+                span.set_attributes(
+                    {
+                        key: value
+                        for key, value in topic_report_payload.items()
+                        if key != "rejections"
+                    }
+                )
             except Exception:  # pragma: no cover
                 pass
 
@@ -621,10 +872,8 @@ class IngestionService:
                     resolved=resolved,
                     raw_extracted=raw_snapshot,
                     job_run_id=job_run_id,
-                )
-                curation_rows = await self._curate_resolved_entities_traced(
-                    outcomes,
-                    job_run_id=job_run_id,
+                    article_extraction_policy_hash=article_extraction_policy_hash,
+                    article_extraction_policy=article_extraction_policy,
                 )
         except Exception as exc:
             duration_ms = round((perf_counter() - stage_started) * 1000, 2)
@@ -666,17 +915,34 @@ class IngestionService:
 
         result.success = True
         result.duration_ms = duration_ms
-        result.curation_rows = curation_rows
         result.input_tokens = int(extraction_metadata.get("input_tokens") or 0)
         result.output_tokens = int(extraction_metadata.get("output_tokens") or 0)
         result.extract_row = {
             "article_url": article.url,
             "title": (article.title or "")[:200],
             "source_name": article.source_name,
+            "primary_type": article.primary_type,
+            "selected_container": (
+                article.cleaning.selected_container if article.cleaning else None
+            ),
+            "text_chars_before_cleaning": (
+                article.cleaning.text_chars_before if article.cleaning else len(article.text)
+            ),
+            "text_chars_after_cleaning": (
+                article.cleaning.text_chars_after if article.cleaning else len(article.text)
+            ),
+            "removed_block_count": (
+                len(article.cleaning.removed_blocks) if article.cleaning else 0
+            ),
+            "remaining_promotion_marker_count": (
+                len(article.cleaning.remaining_promotion_markers) if article.cleaning else 0
+            ),
+            **prompt_audit,
             "status": "succeeded",
             "entity_count": cleaned.entity_count(),
             "relationship_count": len(cleaned.relationships),
             **raw_status_counts,
+            **_topic_report_counts(topic_report_payload),
             "attempts": extraction_metadata.get("attempts"),
             "latency_ms": extraction_metadata.get("latency_ms"),
             "trace_id": extraction_metadata.get("trace_id") or _current_trace_id(),
@@ -695,12 +961,12 @@ class IngestionService:
             "entity_count": cleaned.entity_count(),
             "relationship_count": len(cleaned.relationships),
             **raw_status_counts,
+            **_topic_report_counts(topic_report_payload),
             "resolved_exact": method_counts["exact"],
             "resolved_fuzzy": method_counts["fuzzy"],
             "resolved_embedding": method_counts["embedding"],
             "resolved_new": method_counts["new"],
             "graph_operations": graph_ops,
-            "entity_profile_curation_rows": len(curation_rows),
             "trace_id": _current_trace_id(),
         }
         result.outcome_rows = [
@@ -715,13 +981,18 @@ class IngestionService:
             "article_url": article.url,
             "title": article.title,
             "source_name": article.source_name,
+            "primary_type": article.primary_type,
+            "cleaning": cleaning_payload,
+            "prompt_input": extraction_metadata.get("prompt_input", prompt_input),
+            "user_prompt": extraction_metadata.get("user_prompt"),
+            **prompt_audit,
             "trace_id": _current_trace_id(),
             "extraction": cleaned.model_dump(mode="json"),
             "raw_extraction": raw_snapshot,
             "evidence_status_counts": raw_status_counts,
+            "topic_ontology": topic_report_payload,
             "outcomes": [outcome.to_dict() for outcome in outcomes],
             "graph_operations": graph_ops,
-            "entity_profile_curation": curation_rows,
         }
 
         if span is not None:
@@ -732,7 +1003,7 @@ class IngestionService:
                         "entities_extracted": cleaned.entity_count(),
                         "entities_resolved": len(outcomes),
                         "graph_operations": graph_ops,
-                        "entity_profile_curation_rows": len(curation_rows),
+                        "topic_ontology": topic_report_payload,
                         "resolution_methods": method_counts,
                         "duration_ms": duration_ms,
                     }
@@ -831,32 +1102,73 @@ class IngestionService:
                 pass
         return extraction
 
+    def _enforce_topic_ontology_traced(
+        self,
+        article: ArticleIn,
+        extraction: ExtractionResult,
+    ) -> TopicOntologyReport:
+        ontology = getattr(self, "topic_ontology", None) or get_topic_ontology()
+        with mlflow.start_span(name="topic_ontology_gate", span_type=SpanType.CHAIN) as span:
+            report = ontology.enforce(extraction)
+            payload = report.to_dict()
+            if report.rejections:
+                self.logger.warning(
+                    "topic_ontology_rejections",
+                    extra={
+                        "event": "extraction",
+                        "workflow_step": "topic_ontology",
+                        "url": article.url,
+                        "count": len(report.rejections),
+                        "skipped_count": (report.topics_rejected + report.has_topic_rejected),
+                        "detail": json.dumps(
+                            report.rejections,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                )
+            try:
+                span.set_inputs(
+                    {
+                        "article_url": article.url,
+                        "topic_candidates": report.topic_candidates,
+                        "has_topic_candidates": report.has_topic_candidates,
+                    }
+                )
+                span.set_outputs(payload)
+                span.set_attributes(
+                    {key: value for key, value in payload.items() if key != "rejections"}
+                )
+            except Exception:  # pragma: no cover
+                pass
+            return report
+
     async def _resolve_traced(
         self,
         resolver: EntityResolver,
-        article: ArticleIn,  # noqa: ARG002 — kept for symmetry with the call site
+        article: ArticleIn,
         extraction: ExtractionResult,
     ) -> tuple[dict[tuple[str, str], NormalizedEntity], list[ResolutionOutcome]]:
         # Manual span — the return value contains a dict with tuple keys
         # which the @mlflow.trace auto-capture cannot JSON-serialize.
         with mlflow.start_span(name="resolve_entities", span_type=SpanType.CHAIN) as span:
-            return await self._do_resolve_entities(span, resolver, extraction)
+            return await self._do_resolve_entities(span, resolver, article, extraction)
 
     async def _do_resolve_entities(
         self,
         span,
         resolver: EntityResolver,
+        article: ArticleIn,
         extraction: ExtractionResult,
     ) -> tuple[dict[tuple[str, str], NormalizedEntity], list[ResolutionOutcome]]:
-        self._dedupe_topics(extraction)
-        self._ensure_relationship_entities(extraction)
+        self._ensure_relationship_entities(extraction, article)
         relationship_neighbors = _relationship_neighbor_keys(extraction)
+        ontology = getattr(self, "topic_ontology", None) or get_topic_ontology()
 
         _entity_groups: list[tuple[str, list[ExtractedEntity]]] = [
             ("Startup", extraction.startups),
             ("Investor", extraction.investors),
             ("Person", extraction.people),
-            ("Topic", extraction.topics),
             ("Company", extraction.companies),
         ]
 
@@ -885,6 +1197,15 @@ class IngestionService:
 
         mapping: dict[tuple[str, str], NormalizedEntity] = {}
         outcomes: list[ResolutionOutcome] = []
+        for topic in extraction.topics:
+            concept = ontology.lookup(topic.name)
+            if concept is None:
+                raise ValueError(
+                    f"Topic reached resolution outside the closed ontology: {topic.name!r}"
+                )
+            resolved_topic = ontology.normalized_entity(concept, topic)
+            self._add_mapping(mapping, "Topic", topic, resolved_topic)
+
         # Track (outcome, entity_type, raw_name) to attach pre-fetched embeddings after the loop
         _outcome_keys: list[tuple[ResolutionOutcome, str, str]] = []
         for entity_type, entities in _entity_groups:
@@ -913,7 +1234,7 @@ class IngestionService:
                 )
                 outcomes.append(outcome)
                 _outcome_keys.append((outcome, entity_type, entity.name))
-                self._add_mapping(mapping, entity_type, entity, outcome)
+                self._add_mapping(mapping, entity_type, entity, outcome.entity)
 
         # Attach pre-computed embeddings to new entities so they're stored in Neo4j
         # and available for vector search on the next ingestion run.
@@ -983,11 +1304,9 @@ class IngestionService:
             except Exception:  # pragma: no cover
                 pass
 
-            evidence = self._resolve_candidate_evidence(entity)
             outcome = await resolver.resolve(
                 entity_type,
                 entity,
-                candidate_evidence=evidence,
                 precomputed_embedding=precomputed_embedding,
                 blocked_entity_ids=blocked_entity_ids,
                 blocked_canonical_keys=blocked_canonical_keys,
@@ -999,101 +1318,18 @@ class IngestionService:
                         "method": outcome.method,
                         "canonical": outcome.entity.canonical_name,
                         "entity_id": outcome.entity.id,
+                        "candidate_type": entity_type,
+                        "resolved_type": outcome.entity.label,
+                        "type_promoted": outcome.type_promoted,
                         "similarity_min": outcome.similarity_min,
                     }
                 )
                 span.set_attribute("resolution_method", outcome.method)
+                span.set_attribute("resolved_entity_type", outcome.entity.label)
+                span.set_attribute("type_promoted", outcome.type_promoted)
             except Exception:  # pragma: no cover
                 pass
             return outcome
-
-    async def _curate_resolved_entities_traced(
-        self,
-        outcomes: list[ResolutionOutcome],
-        *,
-        job_run_id: str,
-    ) -> list[dict[str, Any]]:
-        if not self.settings.enable_entity_description_curation or self.profile_curation is None:
-            return []
-
-        entity_ids = sorted({outcome.entity.id for outcome in outcomes if outcome.entity.id})
-        if not entity_ids:
-            return []
-
-        stage_started = perf_counter()
-        with mlflow.start_span(
-            name="curate_resolved_entity_profiles",
-            span_type=SpanType.CHAIN,
-        ) as span:
-            try:
-                span.set_inputs(
-                    {
-                        "job_run_id": job_run_id,
-                        "entity_ids": entity_ids,
-                        "entity_count": len(entity_ids),
-                    }
-                )
-            except Exception:  # pragma: no cover
-                pass
-
-            self.logger.info(
-                "workflow_stage_started",
-                extra={
-                    "event": "curation",
-                    "workflow_step": "entity_profile_curation",
-                    "count": len(entity_ids),
-                    "detail": "reviewing resolved entity profile candidates",
-                },
-            )
-            try:
-                rows = await self.profile_curation.curate_entity_ids(
-                    entity_ids,
-                    job_run_id=job_run_id,
-                )
-            except Exception as exc:
-                rows = [
-                    {
-                        "status": "failed",
-                        "stage": "entity_profile_curation",
-                        "entity_ids": entity_ids,
-                        "error": str(exc)[:300],
-                    }
-                ]
-                self.logger.warning(
-                    "entity_profile_curation_stage_failed",
-                    extra={
-                        "event": "curation",
-                        "workflow_step": "entity_profile_curation",
-                        "error": str(exc),
-                    },
-                )
-
-            duration_ms = round((perf_counter() - stage_started) * 1000, 2)
-            try:
-                span.set_outputs(
-                    {
-                        "status": "succeeded"
-                        if not any(row.get("status") == "failed" for row in rows)
-                        else "failed",
-                        "duration_ms": duration_ms,
-                        "profile_curation_rows": len(rows),
-                    }
-                )
-                span.set_attribute("entity_profile_curation_duration_ms", duration_ms)
-                span.set_attribute("entity_profile_curation_rows", len(rows))
-            except Exception:  # pragma: no cover
-                pass
-            self.logger.info(
-                "workflow_stage_completed",
-                extra={
-                    "event": "curation",
-                    "workflow_step": "entity_profile_curation",
-                    "duration_ms": duration_ms,
-                    "count": len(rows),
-                    "detail": f"profile_curation_rows={len(rows)}",
-                },
-            )
-            return rows
 
     async def _write_traced(
         self,
@@ -1103,6 +1339,8 @@ class IngestionService:
         resolved: dict[tuple[str, str], NormalizedEntity],
         raw_extracted: dict[str, Any],
         job_run_id: str,
+        article_extraction_policy_hash: str,
+        article_extraction_policy: dict[str, Any],
     ) -> int:
         # Manual span instead of @mlflow.trace because `resolved` has
         # tuple keys (entity_type, normalized_name) which auto-input
@@ -1135,6 +1373,9 @@ class IngestionService:
                 mlflow_trace_url=mlflow_trace_url,
                 mlflow_experiment_id=mlflow_experiment_id,
                 job_run_id=job_run_id,
+                article_extraction_policy_hash=article_extraction_policy_hash,
+                article_extraction_policy=article_extraction_policy,
+                profile_curation_policy_hash=self.profile_curation_policy_hash,
             )
             try:
                 span.set_attribute("graph_operations", operations)
@@ -1146,10 +1387,6 @@ class IngestionService:
     # ------------------------------------------------------------------
     # Pure helpers (no MLflow / no tracing)
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _resolve_candidate_evidence(entity: ExtractedEntity) -> str | None:
-        return (entity.source.evidence or "").strip()[:_MAX_EVIDENCE_CHARS] or None
 
     @staticmethod
     def _registry_size(resolver: EntityResolver) -> int:
@@ -1178,7 +1415,10 @@ class IngestionService:
         extraction.topics = topics
 
     @staticmethod
-    def _ensure_relationship_entities(extraction: ExtractionResult) -> None:
+    def _ensure_relationship_entities(
+        extraction: ExtractionResult,
+        article: ArticleIn,
+    ) -> None:
         by_type: dict[EntityType, list[ExtractedEntity]] = {
             "Startup": extraction.startups,
             "Investor": extraction.investors,
@@ -1189,9 +1429,12 @@ class IngestionService:
 
         # An admitted direct relationship is sufficient evidence to materialize its
         # endpoints when the model omitted or quarantined a separate entity record.
-        rel_status: dict[tuple[EntityType, str], EvidenceStatus] = {}
+        rel_support: dict[tuple[EntityType, str], tuple[EvidenceStatus, str]] = {}
         for relationship in extraction.relationships:
             if relationship.evidence_status not in ADMITTED_EVIDENCE_STATUSES:
+                continue
+            evidence = (relationship.evidence or "").strip()
+            if not evidence:
                 continue
             for etype, ename in (
                 (relationship.source_type, relationship.source_name),
@@ -1199,10 +1442,20 @@ class IngestionService:
             ):
                 rkey = NameNormalizer.key(ename, etype)
                 if rkey:
-                    previous = rel_status.get((etype, rkey), "unsure")
-                    rel_status[(etype, rkey)] = strongest_evidence_status(
-                        previous, relationship.evidence_status
-                    )
+                    key = (etype, rkey)
+                    previous = rel_support.get(key)
+                    if (
+                        previous is None
+                        or strongest_evidence_status(
+                            previous[0],
+                            relationship.evidence_status,
+                        )
+                        != previous[0]
+                    ):
+                        rel_support[key] = (
+                            relationship.evidence_status,
+                            evidence,
+                        )
 
         def ensure(entity_type: EntityType, name: str) -> None:
             key = NameNormalizer.key(name, entity_type)
@@ -1213,12 +1466,20 @@ class IngestionService:
                 for entity in by_type[entity_type]
             )
             if not exists:
-                inherited = rel_status.get((entity_type, key), "unsure")
-                if inherited in ADMITTED_EVIDENCE_STATUSES:
+                support = rel_support.get((entity_type, key))
+                if support is not None:
+                    evidence_status, evidence = support
                     by_type[entity_type].append(
                         ExtractedEntity(
                             name=name,
-                            evidence_status=inherited,
+                            type_basis="contextual",
+                            evidence_status=evidence_status,
+                            description=evidence,
+                            source=SourceAttribution(
+                                article_url=article.url,
+                                article_title=article.title,
+                                evidence=evidence,
+                            ),
                         )
                     )
 
@@ -1231,9 +1492,8 @@ class IngestionService:
         mapping: dict[tuple[str, str], NormalizedEntity],
         entity_type: str,
         entity: ExtractedEntity,
-        outcome: ResolutionOutcome,
+        resolved: NormalizedEntity,
     ) -> None:
-        resolved = outcome.entity
         names = [
             entity.name,
             *entity.aliases,
@@ -1264,6 +1524,21 @@ def _raw_extracted_entities_snapshot(extraction: ExtractionResult) -> dict[str, 
             "companies",
             "relationships",
         )
+    }
+
+
+def _topic_report_counts(report: dict[str, Any]) -> dict[str, int]:
+    return {
+        "topic_candidates": int(report.get("topic_candidates", 0) or 0),
+        "topics_kept": int(report.get("topics_kept", 0) or 0),
+        "topics_rejected": int(report.get("topics_rejected", 0) or 0),
+        "has_topic_candidates": int(report.get("has_topic_candidates", 0) or 0),
+        "has_topic_kept": int(report.get("has_topic_kept", 0) or 0),
+        "has_topic_relationships_rejected": int(report.get("has_topic_rejected", 0) or 0),
+        "topic_names_canonicalized": int(report.get("topic_names_canonicalized", 0) or 0),
+        "orphan_topics_removed": int(report.get("orphan_topics_removed", 0) or 0),
+        "duplicate_topics_merged": int(report.get("duplicate_topics_merged", 0) or 0),
+        "duplicate_has_topic_merged": int(report.get("duplicate_has_topic_merged", 0) or 0),
     }
 
 

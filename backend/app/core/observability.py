@@ -8,8 +8,12 @@ from typing import Any
 async def timed_step(logger, event: str, **fields: Any) -> AsyncIterator[None]:
     start = perf_counter()
     workflow_step = fields.pop("workflow_step", event)
+    start_summary = fields.pop("start_summary", None)
     base_fields = {"event": event, "workflow_step": workflow_step, **fields}
-    logger.info("step_started", extra=base_fields)
+    start_fields = base_fields
+    if start_summary is not None:
+        start_fields = {"summary": start_summary, **base_fields}
+    logger.info("step_started", extra=start_fields)
     try:
         yield
     except Exception as exc:

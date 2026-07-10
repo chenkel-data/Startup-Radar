@@ -11,6 +11,7 @@ from app.graph.common import (
     public_relationship_properties,
 )
 from app.models.extraction import ExtractedRelationship
+from app.relationship_contract import has_valid_relationship_signature
 
 
 INVERSE_CONFLICT_QUERY = """
@@ -237,19 +238,11 @@ async def mark_claim_conflicts_tx(tx) -> None:
 
 
 def has_valid_claim_direction(relationship: ExtractedRelationship) -> bool:
-    source_type = relationship.source_type
-    target_type = relationship.target_type
-    if relationship.type == "INVESTED_IN":
-        return source_type in {"Investor", "Company", "Person"} and target_type == "Startup"
-    if relationship.type == "FOUNDED_BY":
-        return source_type == "Startup" and target_type == "Person"
-    if relationship.type == "EMPLOYED_BY":
-        return source_type == "Person" and target_type in {"Startup", "Company"}
-    if relationship.type == "ACQUIRED":
-        return source_type in {"Startup", "Company"} and target_type in {"Startup", "Company"}
-    if relationship.type == "HAS_TOPIC":
-        return source_type != "Topic" and target_type == "Topic"
-    return True
+    return has_valid_relationship_signature(
+        relationship.type,
+        relationship.source_type,
+        relationship.target_type,
+    )
 
 
 def claim_endpoint_ids(relationship_type: str, source_id: str, target_id: str) -> tuple[str, str]:

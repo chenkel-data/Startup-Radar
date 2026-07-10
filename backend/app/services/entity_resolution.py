@@ -12,10 +12,13 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models.extraction import (
     EntityType,
+    EntityTypeBasis,
     ExtractedEntity,
     NormalizedEntity,
     strongest_evidence_status,
+    strongest_type_basis,
 )
+from app.relationship_contract import is_organization_type
 
 if TYPE_CHECKING:
     from app.services.embedding import EmbeddingService
@@ -23,6 +26,26 @@ if TYPE_CHECKING:
 ResolutionMethod = Literal["exact", "fuzzy", "embedding", "new"]
 
 _MAX_DESCRIPTIONS = 5
+_TYPE_BASIS_PRIORITY: dict[EntityTypeBasis, int] = {
+    "fallback": 0,
+    "contextual": 1,
+    "legacy": 2,
+    "explicit": 3,
+}
+_ORGANIZATION_TYPE_PRIORITY: dict[EntityType, int] = {
+    "Company": 1,
+    "Investor": 2,
+    "Startup": 3,
+    "Person": 0,
+    "Topic": 0,
+}
+_ENTITY_TYPE_ORDER: dict[EntityType, int] = {
+    "Startup": 0,
+    "Investor": 1,
+    "Company": 2,
+    "Person": 3,
+    "Topic": 4,
+}
 
 
 @dataclass
@@ -32,6 +55,7 @@ class ResolutionOutcome:
     candidate_name: str
     merged_into: str | None = None
     similarity_min: float | None = None
+    type_promoted: bool = False
     registry_entry: RegistryEntry | None = (
         None  # set for "new" entities, used for embedding backfill
     )
@@ -42,6 +66,7 @@ class ResolutionOutcome:
             "method": self.method,
             "canonical": self.entity.canonical_name,
             "entity_id": self.entity.id,
+            "type_promoted": self.type_promoted,
             **({"merged_into": self.merged_into} if self.merged_into else {}),
             **(
                 {"similarity_min": round(self.similarity_min, 3)}
@@ -141,7 +166,11 @@ class NameNormalizer:
             tokens = value.split()
             if entity_type in ("Startup", "Investor"):
                 tokens = [t for t in tokens if t not in _LEGAL_SUFFIXES]
-            # Topic: keep all tokens, just normalised
+            if entity_type == "Topic":
+                # Normalize hyphenated and spaced forms to the same deterministic key.
+                value = value.replace("-", " ")
+                value = re.sub(r"\s+", " ", value).strip()
+                tokens = value.split()
 
         return " ".join(tokens).strip()
 
@@ -282,9 +311,14 @@ class EntityResolver:
             "Company": [],
         }
         self._alias_index: dict[tuple[EntityType, str], RegistryEntry] = {}
+        self._organization_index: dict[str, RegistryEntry] = {}
 
     async def load_from_graph(self, graph_repository) -> None:
         for label in self._entries_by_type:
+            if label == "Topic":
+                # Topic identity comes exclusively from the closed ontology, so persisted
+                # Topic nodes do not participate in general entity matching.
+                continue
             rows = await graph_repository.list_entities(label)
             for row in rows:
                 entity = NormalizedEntity(
@@ -293,47 +327,44 @@ class EntityResolver:
                     canonical_name=row.get("canonical_name") or row.get("name"),
                     name=row.get("name") or row.get("canonical_name"),
                     aliases=row.get("aliases") or [],
+                    primary_type_basis=row.get("primary_type_basis") or "legacy",
+                    observed_types=row.get("observed_types") or [label],
+                    type_conflict=bool(row.get("type_conflict")),
                     evidence_status=row.get("evidence_status") or "unsure",
                     description=row.get("description"),
                 )
                 entry = self._add_entry(entity)
                 if row.get("descriptions"):
                     entry.descriptions = list(row["descriptions"])
-        self.logger.info(
-            "entity_registry_loaded",
-            extra={
-                "event": "resolution",
-                "workflow_step": "registry_load",
-                "count": sum(len(v) for v in self._entries_by_type.values()),
-            },
-        )
 
     async def resolve(
         self,
         entity_type: EntityType,
         entity: ExtractedEntity,
-        candidate_evidence: str | None = None,  # kept for call-site compatibility
         precomputed_embedding: list[float] | None = None,
         blocked_entity_ids: set[str] | None = None,
         blocked_canonical_keys: set[str] | None = None,
     ) -> ResolutionOutcome:
+        if entity_type == "Topic":
+            raise ValueError("Topic entities must be resolved through the closed topic ontology")
         blocked_entity_ids = blocked_entity_ids or set()
         blocked_canonical_keys = blocked_canonical_keys or set()
+        resolution_type = _canonical_resolution_type(entity_type, entity.type_basis)
         display = NameNormalizer.display(entity.name)
         all_names = [display, *(a for a in entity.aliases if a)]
-        candidate_keys = [NameNormalizer.key(n, entity_type) for n in all_names]
-        candidate_token_sets = [NameNormalizer.token_set(n, entity_type) for n in all_names]
+        candidate_keys = [NameNormalizer.key(n, resolution_type) for n in all_names]
+        candidate_token_sets = [NameNormalizer.token_set(n, resolution_type) for n in all_names]
         candidate_pairs = [(k, ts) for k, ts in zip(candidate_keys, candidate_token_sets) if k]
         if not candidate_pairs:
             candidate_pairs = [(NameNormalizer.slug(display), frozenset())]
 
-        # Stage 1a: Exact key lookup
+        # Exact normalized-key lookup
         for ckey, _ in candidate_pairs:
-            exact = self._alias_index.get((entity_type, ckey))
+            exact = self._alias_index.get((resolution_type, ckey))
             if exact:
                 if await self._relationship_blocks_merge(
                     exact,
-                    entity_type=entity_type,
+                    entity_type=resolution_type,
                     candidate_name=entity.name,
                     candidate_names=all_names,
                     method="exact",
@@ -350,7 +381,15 @@ class EntityResolver:
                         "detail": f'merged "{entity.name}" -> "{exact.entity.canonical_name}"',
                     },
                 )
-                result = self._merge_into_entry(exact, entity, display, candidate_pairs)
+                self._reconcile_organization_type(exact, entity_type, entity.type_basis)
+                resolved_pairs = self._candidate_pairs(all_names, exact.entity.label)
+                result = self._merge_into_entry(
+                    exact,
+                    entity,
+                    display,
+                    resolved_pairs,
+                    observed_type=entity_type,
+                )
                 return ResolutionOutcome(
                     entity=result,
                     method="exact",
@@ -358,9 +397,62 @@ class EntityResolver:
                     merged_into=result.canonical_name,
                 )
 
-        # Stage 1b: Multi-metric heuristic matching
+        # Startup, Investor, and Company are identity labels for one underlying
+        # organization. Exact normalized names share a canonical node, while
+        # fuzzy and embedding matching remain confined to the canonical type.
+        if is_organization_type(entity_type):
+            for candidate_name in all_names:
+                shared_key = _organization_key(candidate_name)
+                exact = self._organization_index.get(shared_key)
+                if exact is None or exact.entity.label == resolution_type:
+                    continue
+                if await self._relationship_blocks_merge(
+                    exact,
+                    entity_type=resolution_type,
+                    candidate_name=entity.name,
+                    candidate_names=all_names,
+                    method="exact",
+                    blocked_entity_ids=blocked_entity_ids,
+                    blocked_canonical_keys=blocked_canonical_keys,
+                ):
+                    continue
+
+                previous_type = exact.entity.label
+                self._reconcile_organization_type(exact, entity_type, entity.type_basis)
+                resolved_type = exact.entity.label
+                resolved_pairs = self._candidate_pairs(all_names, resolved_type)
+                result = self._merge_into_entry(
+                    exact,
+                    entity,
+                    display,
+                    resolved_pairs,
+                    observed_type=entity_type,
+                )
+                promoted = previous_type != resolved_type
+                self.logger.info(
+                    "entity_merged_cross_type_exact",
+                    extra={
+                        "event": "resolution",
+                        "workflow_step": "entity_resolution",
+                        "entity_type": entity_type,
+                        "detail": (
+                            f'merged "{entity.name}" ({entity_type}) -> '
+                            f'"{result.canonical_name}" ({resolved_type}); '
+                            f"type_promoted={promoted}"
+                        ),
+                    },
+                )
+                return ResolutionOutcome(
+                    entity=result,
+                    method="exact",
+                    candidate_name=display,
+                    merged_into=result.canonical_name,
+                    type_promoted=promoted,
+                )
+
+        # Multi-metric heuristic matching
         best_entry, best_result = self._multi_metric_match(
-            entity_type,
+            resolution_type,
             candidate_pairs,
             blocked_entity_ids=blocked_entity_ids,
             blocked_canonical_keys=blocked_canonical_keys,
@@ -369,7 +461,7 @@ class EntityResolver:
         if best_entry and best_result.minimum >= _AUTO_MERGE_MIN_SCORE:
             if not await self._relationship_blocks_merge(
                 best_entry,
-                entity_type=entity_type,
+                entity_type=resolution_type,
                 candidate_name=entity.name,
                 candidate_names=all_names,
                 method="fuzzy",
@@ -394,7 +486,18 @@ class EntityResolver:
                         ),
                     },
                 )
-                result = self._merge_into_entry(best_entry, entity, display, candidate_pairs)
+                self._reconcile_organization_type(
+                    best_entry,
+                    entity_type,
+                    entity.type_basis,
+                )
+                result = self._merge_into_entry(
+                    best_entry,
+                    entity,
+                    display,
+                    candidate_pairs,
+                    observed_type=entity_type,
+                )
                 return ResolutionOutcome(
                     entity=result,
                     method="fuzzy",
@@ -403,7 +506,7 @@ class EntityResolver:
                     similarity_min=best_result.minimum,
                 )
 
-        # Stage 3: Embedding vector search via Neo4j index
+        # Embedding vector search via Neo4j index
         if (
             self.settings.enable_embedding_resolution
             and self._graph
@@ -415,21 +518,21 @@ class EntityResolver:
                 candidate_text = f"{display}. {entity.description or ''}".strip()
                 candidate_vec = await self._embedding_service.embed_one(candidate_text)
             matched_id, cos_score = await self._graph.find_nearest_entity(
-                label=entity_type,
+                label=resolution_type,
                 embedding=candidate_vec,
                 min_score=self.settings.embedding_similarity_threshold,
                 exclude_ids=blocked_entity_ids,
             )
             if matched_id:
                 # Look up the in-memory entry by id so we can merge into it
-                best_cos_entry = self._entry_by_id(entity_type, matched_id)
+                best_cos_entry = self._entry_by_id(resolution_type, matched_id)
             else:
                 best_cos_entry = None
 
             if best_cos_entry:
                 if not await self._relationship_blocks_merge(
                     best_cos_entry,
-                    entity_type=entity_type,
+                    entity_type=resolution_type,
                     candidate_name=entity.name,
                     candidate_names=all_names,
                     method="embedding",
@@ -450,8 +553,17 @@ class EntityResolver:
                             ),
                         },
                     )
+                    self._reconcile_organization_type(
+                        best_cos_entry,
+                        entity_type,
+                        entity.type_basis,
+                    )
                     result = self._merge_into_entry(
-                        best_cos_entry, entity, display, candidate_pairs
+                        best_cos_entry,
+                        entity,
+                        display,
+                        candidate_pairs,
+                        observed_type=entity_type,
                     )
                     return ResolutionOutcome(
                         entity=result,
@@ -474,11 +586,14 @@ class EntityResolver:
 
         # New entity
         normalized = NormalizedEntity(
-            id=f"{entity_type.lower()}:{NameNormalizer.slug(display)}",
-            label=entity_type,
+            id=f"{resolution_type.lower()}:{NameNormalizer.slug(display)}",
+            label=resolution_type,
             canonical_name=display,
             name=display,
-            aliases=_unique(all_names, entity_type),
+            aliases=_unique(all_names, resolution_type),
+            primary_type_basis=entity.type_basis,
+            observed_types=[entity_type],
+            type_conflict=False,
             evidence_status=entity.evidence_status,
             description=entity.description,
         )
@@ -627,6 +742,8 @@ class EntityResolver:
         entity: ExtractedEntity,
         display: str,
         candidate_pairs: list[tuple[str, frozenset[str]]],
+        *,
+        observed_type: EntityType,
     ) -> NormalizedEntity:
         all_aliases = _unique(
             [*entry.entity.aliases, display, entity.name, *entity.aliases],
@@ -635,6 +752,9 @@ class EntityResolver:
         entry.entity.aliases = all_aliases
         entry.entity.evidence_status = strongest_evidence_status(
             entry.entity.evidence_status, entity.evidence_status
+        )
+        entry.entity.observed_types = _ordered_entity_types(
+            [*entry.entity.observed_types, observed_type]
         )
         entry.entity.canonical_name = _select_canonical(entry.entity.canonical_name, display)
 
@@ -652,6 +772,7 @@ class EntityResolver:
 
         # Sync description pool back onto the entity model for persistence
         entry.entity.descriptions = list(entry.descriptions)
+        self._index_organization_entry(entry)
 
         return entry.entity
 
@@ -674,12 +795,119 @@ class EntityResolver:
         self._entries_by_type[entity.label].append(entry)
         for k in keys:
             self._alias_index[(entity.label, k)] = entry
+        self._index_organization_entry(entry)
         return entry
+
+    @staticmethod
+    def _candidate_pairs(
+        names: list[str],
+        entity_type: EntityType,
+    ) -> list[tuple[str, frozenset[str]]]:
+        pairs: list[tuple[str, frozenset[str]]] = []
+        for name in names:
+            key = NameNormalizer.key(name, entity_type)
+            if key:
+                pairs.append((key, NameNormalizer.token_set(name, entity_type)))
+        return pairs
+
+    def _index_organization_entry(self, entry: RegistryEntry) -> None:
+        if not is_organization_type(entry.entity.label):
+            return
+        for name in (
+            entry.entity.canonical_name,
+            entry.entity.name,
+            *entry.entity.aliases,
+        ):
+            key = _organization_key(name)
+            if key:
+                self._organization_index.setdefault(key, entry)
+
+    def _reconcile_organization_type(
+        self,
+        entry: RegistryEntry,
+        observed_type: EntityType,
+        type_basis: EntityTypeBasis,
+    ) -> None:
+        if not is_organization_type(entry.entity.label) or not is_organization_type(observed_type):
+            return
+        candidate_type = _canonical_resolution_type(observed_type, type_basis)
+        existing_score = _organization_type_score(
+            entry.entity.label,
+            entry.entity.primary_type_basis,
+        )
+        candidate_score = _organization_type_score(candidate_type, type_basis)
+
+        if (
+            type_basis == "explicit"
+            and entry.entity.primary_type_basis == "explicit"
+            and {entry.entity.label, candidate_type} == {"Startup", "Investor"}
+        ):
+            entry.entity.type_conflict = True
+
+        if candidate_score > existing_score:
+            self._retype_organization(entry, candidate_type)
+            entry.entity.primary_type_basis = type_basis
+        elif candidate_type == entry.entity.label:
+            entry.entity.primary_type_basis = strongest_type_basis(
+                entry.entity.primary_type_basis,
+                type_basis,
+            )
+
+    def _retype_organization(self, entry: RegistryEntry, new_type: EntityType) -> None:
+        old_type = entry.entity.label
+        if old_type == new_type:
+            return
+        for key in entry.keys:
+            if self._alias_index.get((old_type, key)) is entry:
+                self._alias_index.pop((old_type, key))
+        self._entries_by_type[old_type].remove(entry)
+
+        entry.entity.label = new_type
+        names = [entry.entity.canonical_name, entry.entity.name, *entry.entity.aliases]
+        pairs = [
+            (NameNormalizer.key(name, new_type), NameNormalizer.token_set(name, new_type))
+            for name in names
+            if name
+        ]
+        entry.keys = {key for key, _ in pairs if key}
+        entry.token_sets = [tokens for key, tokens in pairs if key]
+        self._entries_by_type[new_type].append(entry)
+        for key in entry.keys:
+            self._alias_index[(new_type, key)] = entry
+        self._index_organization_entry(entry)
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+
+def _canonical_resolution_type(
+    observed_type: EntityType,
+    type_basis: EntityTypeBasis,
+) -> EntityType:
+    if observed_type in {"Startup", "Investor"} and type_basis in {"contextual", "fallback"}:
+        return "Company"
+    return observed_type
+
+
+def _organization_type_score(
+    entity_type: EntityType,
+    type_basis: EntityTypeBasis,
+) -> tuple[int, int]:
+    return (
+        _TYPE_BASIS_PRIORITY[type_basis],
+        _ORGANIZATION_TYPE_PRIORITY[entity_type],
+    )
+
+
+def _organization_key(name: str) -> str:
+    # Share legal-suffix-normalized keys across Startup, Investor, and Company labels.
+    return NameNormalizer.key(name, "Startup")
+
+
+def _ordered_entity_types(values: list[EntityType]) -> list[EntityType]:
+    return sorted(set(values), key=_ENTITY_TYPE_ORDER.__getitem__)
 
 
 def _select_canonical(existing: str, _candidate: str) -> str:

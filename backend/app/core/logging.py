@@ -19,6 +19,7 @@ class TerminalFormatter(logging.Formatter):
         ("scraping", "collect"): (1, 5, "Collect articles"),
         ("scraping", "feed"): (1, 5, "Collect article links"),
         ("scraping", "listing"): (1, 5, "Collect article links"),
+        ("scraping", "article_cache"): (1, 5, "Check article cache"),
         ("scraping", "article_fetch"): (1, 5, "Fetch article text"),
         ("scraping", "article_parse"): (1, 5, "Fetch article text"),
         ("ingestion", "resolution_registry"): (2, 5, "Load entity registry"),
@@ -62,13 +63,12 @@ class TerminalFormatter(logging.Formatter):
         "listing_pagination_exhausted": "listing pagination exhausted",
         "listing_page_failed": "listing page failed",
         "article_links_collected": "article links ready",
+        "article_extraction_cache_lookup_failed": "article cache lookup failed",
         "article_fetch_started": "fetching article",
         "article_fetch_completed": "article fetched",
         "article_fetch_skipped": "article skipped",
         "article_fetch_failed": "article fetch failed",
-        "articles_scraped": "article fetch stage completed",
         "article_parse_skipped": "article skipped during parsing",
-        "entity_registry_loaded": "existing entities loaded",
         "article_extraction_started": "extracting article",
         "article_extraction_completed": "article extraction completed",
         "article_extraction_failed": "article extraction permanently failed",
@@ -84,6 +84,8 @@ class TerminalFormatter(logging.Formatter):
         "llm_extraction_retry": "LLM request failed; retry scheduled",
         "llm_extraction_failed": "LLM extraction failed",
         "llm_extraction_missing_api_key": "missing OpenAI API key",
+        "openai_rate_limit_pause": "OpenAI rate limit pause",
+        "openai_rate_limit_summary": "OpenAI rate limit summary",
         "article_extraction_requested": "article prepared for LLM",
         "llm_extraction_completed": "LLM extraction completed",
         "llm_output_received": "LLM output received",
@@ -126,6 +128,9 @@ class TerminalFormatter(logging.Formatter):
         "confidence",
         "duration_ms",
         "count",
+        "cached_count",
+        "scraped_count",
+        "skipped_count",
         "failed_count",
         "detail",
         "url",
@@ -138,6 +143,9 @@ class TerminalFormatter(logging.Formatter):
         "entity_type": "type",
         "entity_name": "entity",
         "failed_count": "failed",
+        "cached_count": "cached",
+        "scraped_count": "scraped",
+        "skipped_count": "skipped",
     }
     FIELD_LIMITS = {
         "article_title": 120,
@@ -146,13 +154,26 @@ class TerminalFormatter(logging.Formatter):
         "url": 180,
         "error": 300,
     }
+    SUMMARY_DUPLICATE_FIELDS = {
+        "count",
+        "cached_count",
+        "scraped_count",
+        "skipped_count",
+        "failed_count",
+        "detail",
+    }
 
     def format(self, record: logging.LogRecord) -> str:
         timestamp = self.formatTime(record, "%H:%M:%S")
         stage = _stage_label(record, self.STAGES)
-        message = self.ACTIONS.get(
-            record.getMessage(),
-            _clean(record.getMessage()).replace("_", " "),
+        summary = getattr(record, "summary", None)
+        message = (
+            _clean(summary)
+            if not _is_empty(summary)
+            else self.ACTIONS.get(
+                record.getMessage(),
+                _clean(record.getMessage()).replace("_", " "),
+            )
         )
 
         line = f"{timestamp} {record.levelname:<7} {stage:<{self.STAGE_WIDTH}} | {message}"
@@ -166,6 +187,8 @@ class TerminalFormatter(logging.Formatter):
             fields.append(attempt)
 
         for field in self.FIELD_ORDER:
+            if not _is_empty(summary) and field in self.SUMMARY_DUPLICATE_FIELDS:
+                continue
             value = getattr(record, field, None)
             if _is_empty(value):
                 continue
@@ -207,11 +230,17 @@ def setup_logging(settings: Settings) -> None:
         formatter = jsonlogger.JsonFormatter(
             "%(asctime)s %(levelname)s %(name)s %(message)s %(event)s %(component)s "
             "%(workflow_step)s %(duration_ms)s %(count)s %(task_id)s %(url)s "
+            "%(cached_count)s %(scraped_count)s %(skipped_count)s "
             "%(entity_type)s %(entity_name)s %(status)s %(decision)s %(confidence)s "
-            "%(detail)s %(article_title)s %(article_index)s "
+            "%(summary)s %(detail)s %(article_title)s %(article_index)s "
             "%(article_total)s %(page_index)s %(page_total)s %(completed_count)s "
             "%(remaining)s %(attempt_index)s %(attempt_total)s %(retry_delay_seconds)s "
-            "%(failed_count)s %(mode)s %(model)s %(error)s"
+            "%(failed_count)s %(mode)s %(model)s %(error)s "
+            "%(article_links_found)s %(article_links_selected)s %(articles_to_fetch)s "
+            "%(articles_skipped_as_processed)s %(articles_fetched)s "
+            "%(articles_failed_or_invalid)s %(articles_processed)s "
+            "%(articles_processing_failed)s %(entities_extracted)s %(graph_operations)s "
+            "%(registry_size)s"
         )
     else:
         formatter = TerminalFormatter()

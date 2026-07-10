@@ -525,6 +525,7 @@ async def upsert_profile_evidence_tx(
     job_run_id: str | None,
     processed_at: str,
     evidence_status: EvidenceStatus,
+    profile_curation_policy_hash: str | None = None,
     relationship_type: str | None = None,
     other_entity_id: str | None = None,
     other_entity_name: str | None = None,
@@ -579,6 +580,15 @@ async def upsert_profile_evidence_tx(
           WHEN $job_run_id IS NULL OR $job_run_id = "" THEN coalesce(e.job_run_ids, [])
           WHEN $job_run_id IN coalesce(e.job_run_ids, []) THEN e.job_run_ids
           ELSE coalesce(e.job_run_ids, []) + [$job_run_id]
+        END,
+        e.ingested_profile_curation_policy_hashes = CASE
+          WHEN $profile_curation_policy_hash IS NULL OR $profile_curation_policy_hash = ""
+            THEN coalesce(e.ingested_profile_curation_policy_hashes, [])
+          WHEN $profile_curation_policy_hash
+            IN coalesce(e.ingested_profile_curation_policy_hashes, [])
+            THEN e.ingested_profile_curation_policy_hashes
+          ELSE coalesce(e.ingested_profile_curation_policy_hashes, [])
+            + [$profile_curation_policy_hash]
         END
     MERGE (n)-[:HAS_PROFILE_EVIDENCE]->(e)
     """
@@ -600,6 +610,7 @@ async def upsert_profile_evidence_tx(
         job_run_id=job_run_id,
         processed_at=processed_at,
         evidence_status=evidence_status,
+        profile_curation_policy_hash=profile_curation_policy_hash,
     )
 
 
