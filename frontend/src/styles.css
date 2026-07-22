@@ -340,6 +340,7 @@ a {
 .ghost-mini {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
   min-height: 30px;
   padding: 0 9px;
@@ -349,6 +350,11 @@ a {
   background: rgba(255, 255, 255, 0.8);
   font-size: 0.78rem;
   transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.ghost-mini:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
 }
 
 .search-box {
@@ -971,12 +977,112 @@ a {
   margin-top: 9px;
 }
 
-.alias-list span {
+.alias-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   padding: 3px 8px;
   border-radius: 999px;
   background: rgba(15, 118, 110, 0.12);
   color: #0b5e58;
   font-size: 0.73rem;
+}
+
+.alias-remove {
+  display: inline-grid;
+  place-items: center;
+  margin: -2px -5px -2px 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.alias-remove:hover {
+  background: rgba(15, 118, 110, 0.14);
+}
+
+.alias-remove:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.alias-add-trigger,
+.alias-inline-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.alias-add-trigger {
+  min-height: 24px;
+  padding: 2px 7px;
+  border: 1px dashed rgba(15, 118, 110, 0.32);
+  border-radius: 999px;
+  background: transparent;
+  color: #0b5e58;
+  cursor: pointer;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.alias-info {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--ink-muted);
+  cursor: help;
+}
+
+.alias-info:focus-visible {
+  outline: 2px solid rgba(15, 118, 110, 0.35);
+  outline-offset: 1px;
+  border-radius: 50%;
+}
+
+.alias-inline-form input,
+.alias-inline-form button {
+  min-height: 26px;
+  border: 1px solid rgba(17, 33, 45, 0.14);
+  border-radius: 7px;
+  font-size: 0.72rem;
+}
+
+.alias-inline-form input {
+  width: 130px;
+  min-width: 90px;
+  padding: 0 7px;
+  background: #ffffff;
+}
+
+.alias-inline-form button {
+  padding: 0 8px;
+  background: rgba(15, 118, 110, 0.1);
+  color: #0b5e58;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.alias-inline-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.alias-inline-form .alias-cancel {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  padding: 0;
+  background: transparent;
+}
+
+.alias-list .alias-error {
+  flex-basis: 100%;
+  color: var(--rose);
+  font-size: 0.7rem;
 }
 
 .article-inspector {
@@ -1390,14 +1496,19 @@ a {
 
 .profile-status-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
+  gap: 7px;
   margin-top: 10px;
   padding: 9px 10px;
   border: 1px solid rgba(15, 118, 110, 0.14);
   border-radius: 12px;
   background: rgba(15, 118, 110, 0.06);
+}
+
+.profile-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .profile-status-copy {
@@ -1428,9 +1539,29 @@ a {
   color: #b45309;
 }
 
+.profile-status-row.rejected {
+  border-color: rgba(220, 38, 38, 0.24);
+  background: rgba(254, 226, 226, 0.64);
+}
+
+.profile-status-row.rejected .profile-status-title {
+  color: #b91c1c;
+}
+
+.profile-status-row.accepted {
+  border-color: rgba(15, 118, 110, 0.25);
+  background: rgba(204, 251, 241, 0.52);
+}
+
+.profile-description-text {
+  color: #263746 !important;
+  font-size: 0.84rem;
+  line-height: 1.44;
+}
+
 .profile-status-copy strong {
   color: #18222d;
-  font-size: 0.82rem;
+  font-size: 0.74rem;
   line-height: 1.25;
 }
 
@@ -1440,16 +1571,85 @@ a {
   line-height: 1.28;
 }
 
-.profile-status-actions {
+.profile-review-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  min-width: 0;
+  gap: 4px;
 }
 
-.profile-status-actions small {
-  color: var(--ink-muted);
-  font-size: 0.7rem;
+.profile-review-actions button,
+.profile-review-actions a {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid rgba(15, 118, 110, 0.2);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #0b5e58;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.profile-review-actions button.danger {
+  border-color: rgba(220, 38, 38, 0.2);
+  color: #b91c1c;
+}
+
+.profile-review-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.profile-description-form {
+  display: grid;
+  gap: 6px;
+}
+
+.profile-description-form textarea {
+  width: 100%;
+  min-height: 108px;
+  padding: 8px;
+  resize: vertical;
+  border: 1px solid rgba(15, 118, 110, 0.28);
+  border-radius: 8px;
+  background: #ffffff;
+  color: #263746;
+  font: inherit;
+  font-size: 0.82rem;
+  line-height: 1.42;
+}
+
+.profile-description-form > div {
+  display: flex;
+  gap: 6px;
+}
+
+.profile-description-form button {
+  min-height: 29px;
+  padding: 0 9px;
+  border: 1px solid rgba(15, 118, 110, 0.25);
+  border-radius: 7px;
+  background: #0f766e;
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.profile-description-form button.secondary {
+  background: rgba(255, 255, 255, 0.8);
+  color: #334155;
+}
+
+.profile-description-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.profile-status-copy .profile-review-error {
+  color: #b91c1c;
 }
 
 .claim-list {
@@ -1660,6 +1860,39 @@ a {
   font-size: 0.67rem;
   font-weight: 800;
   text-transform: uppercase;
+}
+
+.claim-evidence-text {
+  margin: 0;
+}
+
+.claim-evidence-text.collapsed {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.claim-evidence-toggle {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--teal);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+.claim-evidence-toggle:hover {
+  text-decoration: underline;
+}
+
+.claim-evidence-toggle:focus-visible {
+  outline: 2px solid rgba(15, 118, 110, 0.35);
+  outline-offset: 2px;
 }
 
 .claim-status {
@@ -1952,14 +2185,6 @@ a {
   .entity-counts {
     justify-content: flex-start;
     max-width: none;
-  }
-
-  .profile-status-row {
-    grid-template-columns: 1fr;
-  }
-
-  .profile-status-actions {
-    justify-content: flex-start;
   }
 
   .graph-overlay,

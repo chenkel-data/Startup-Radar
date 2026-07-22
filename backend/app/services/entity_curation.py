@@ -1117,6 +1117,10 @@ def profile_embedding_text(entity: dict[str, Any], description: str) -> str:
     ).strip()
 
 
+def profile_embedding_input_hash(entity: dict[str, Any], description: str) -> str:
+    return _hash_text(profile_embedding_text(entity, description))
+
+
 def _entity_trace_labels(entity: dict[str, Any]) -> tuple[str, str, str]:
     entity_name = str(
         entity.get("name") or entity.get("canonical_name") or entity.get("id") or "Unknown entity"

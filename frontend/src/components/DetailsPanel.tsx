@@ -6,11 +6,15 @@ import {
   ArrowRightLeft,
   ChevronDown,
   ChevronRight,
+  Check,
   CheckCircle2,
   ExternalLink,
   FileText,
   Info,
   Network,
+  Pencil,
+  Plus,
+  RotateCcw,
   Tags,
   X,
 } from "lucide-react";
@@ -19,6 +23,8 @@ import { stringValue } from "../lib/helpers";
 import type {
   ClaimAssertion,
   ClaimSourceArticle,
+  EntityAliasResult,
+  EntityDescriptionReviewDecision,
   GraphEdge,
   GraphNode,
   GraphResponse,
@@ -32,6 +38,7 @@ type Props = {
   visibleTypes: Set<string>;
   visibleRelations: Set<string>;
   onOpenGraph: (name: string) => void;
+  onEntityUpdated: (result: EntityAliasResult) => void | Promise<void>;
   onNodeSelect: (node: GraphNode | undefined) => void;
 };
 
@@ -66,10 +73,15 @@ type ProfileTraceReference = {
   experimentId?: string;
   traceUrl?: string;
   tracedAt?: string;
+  humanReviewStatus?: EntityDescriptionReviewDecision;
+  humanReviewedAt?: string;
 };
 
 const DISPLAY_KEYS = [
   "canonical_name",
+  "concept_id",
+  "ontology_version",
+  "semantic_boundary",
   "category",
   "stage",
   "amount",
@@ -111,6 +123,8 @@ type ClaimFilter = "review" | "supported" | "reviewed" | "all";
 
 const INITIAL_VISIBLE_CLAIMS = 6;
 const CLAIM_VISIBLE_STEP = 6;
+const COLLAPSIBLE_EVIDENCE_CHAR_LIMIT = 180;
+const ALIAS_EDITABLE_TYPES = new Set(["Startup", "Investor", "Company", "Person"]);
 
 type ClaimHistoryModel = {
   articles: ClaimSourceArticle[];
@@ -137,13 +151,27 @@ export function DetailsPanel({
   visibleTypes,
   visibleRelations,
   onOpenGraph,
+  onEntityUpdated,
   onNodeSelect,
 }: Props) {
   const [claimData, setClaimData] = useState<NodeClaimsResponse | undefined>();
   const [claimLoading, setClaimLoading] = useState(false);
   const [claimError, setClaimError] = useState<string | undefined>();
   const [reviewingEdgeId, setReviewingEdgeId] = useState<string | undefined>();
+  const [aliasValue, setAliasValue] = useState("");
+  const [aliasEditing, setAliasEditing] = useState(false);
+  const [aliasSaving, setAliasSaving] = useState(false);
+  const [aliasRemoving, setAliasRemoving] = useState<string | undefined>();
+  const [aliasError, setAliasError] = useState<string | undefined>();
   const nodesById = useMemo(() => new Map(graph.nodes.map((entry) => [entry.id, entry])), [graph.nodes]);
+
+  useEffect(() => {
+    setAliasValue("");
+    setAliasEditing(false);
+    setAliasSaving(false);
+    setAliasRemoving(undefined);
+    setAliasError(undefined);
+  }, [node?.id]);
 
   useEffect(() => {
     if (!node || node.type === "Article") {
@@ -231,10 +259,15 @@ export function DetailsPanel({
 
   const aliases = useMemo(() => {
     if (!node) return [];
+    const entityNames = new Set(
+      [node.label, node.properties.name, node.properties.canonical_name]
+        .map(normalizeAliasName)
+        .filter(Boolean),
+    );
     return Array.isArray(node.properties.aliases)
       ? node.properties.aliases
           .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-          .filter((entry) => entry.length > 0)
+          .filter((entry) => entry.length > 0 && !entityNames.has(normalizeAliasName(entry)))
       : [];
   }, [node]);
 
@@ -273,10 +306,8 @@ export function DetailsPanel({
   const traceRefs = useMemo(() => buildArticleTraceReferences(node), [node]);
   const profileTrace = useMemo(() => buildProfileTraceReference(node), [node]);
 
-  const summary =
-    node &&
-    (stringValue(node.properties.description) ??
-      buildSynopsis(node, connections.length, relationshipMix.length));
+  const description = node ? stringValue(node.properties.description) : undefined;
+  const summary = node && (description ?? buildSynopsis(node, connections.length, relationshipMix.length));
 
   const url = node ? stringValue(node.properties.url) : undefined;
 
@@ -293,6 +324,37 @@ export function DetailsPanel({
       setClaimError(error instanceof Error ? error.message : "Claim review failed");
     } finally {
       setReviewingEdgeId(undefined);
+    }
+  }
+
+  async function addAlias() {
+    const alias = aliasValue.trim();
+    if (!node || !alias) return;
+    setAliasSaving(true);
+    setAliasError(undefined);
+    try {
+      const result = await api.addEntityAlias(node.id, alias);
+      setAliasValue("");
+      setAliasEditing(false);
+      await onEntityUpdated(result);
+    } catch (error) {
+      setAliasError(error instanceof Error ? error.message : "Alias could not be added");
+    } finally {
+      setAliasSaving(false);
+    }
+  }
+
+  async function removeAlias(alias: string) {
+    if (!node) return;
+    setAliasRemoving(alias);
+    setAliasError(undefined);
+    try {
+      const result = await api.removeEntityAlias(node.id, alias);
+      await onEntityUpdated(result);
+    } catch (error) {
+      setAliasError(error instanceof Error ? error.message : "Alias could not be removed");
+    } finally {
+      setAliasRemoving(undefined);
     }
   }
 
@@ -322,18 +384,97 @@ export function DetailsPanel({
           <section className="node-hero">
             <span className={`entity-badge ${node.type.toLowerCase()}`}>{node.type}</span>
             <h3>{node.label}</h3>
-            {summary && <p>{summary}</p>}
+            {node.type === "Article"
+              ? summary && <p>{summary}</p>
+              : summary && (
+                  <EntityDescriptionReview
+                    description={description}
+                    fallbackDescription={summary}
+                    nodeId={node.id}
+                    onRefresh={() => onOpenGraph(node.label)}
+                    profileTrace={profileTrace}
+                  />
+                )}
 
-            {aliases.length > 0 && (
-              <div className="alias-list">
-                {aliases.slice(0, 8).map((alias) => (
-                  <span key={alias}>{alias}</span>
+            {ALIAS_EDITABLE_TYPES.has(node.type) && (
+              <div aria-label="Aliases" className="alias-list">
+                {aliases.map((alias) => (
+                  <span
+                    aria-label={`${alias}, alias`}
+                    className="alias-chip"
+                    key={alias}
+                    title={`Alias: ${alias}`}
+                  >
+                    {alias}
+                    <button
+                      aria-label={`Alias ${alias} entfernen`}
+                      className="alias-remove"
+                      disabled={aliasRemoving !== undefined}
+                      onClick={() => void removeAlias(alias)}
+                      title="Alias entfernen"
+                      type="button"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
                 ))}
+                {aliasEditing ? (
+                  <form
+                    className="alias-inline-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void addAlias();
+                    }}
+                  >
+                    <input
+                      aria-label="New alias"
+                      autoFocus
+                      disabled={aliasSaving}
+                      maxLength={200}
+                      onChange={(event) => setAliasValue(event.target.value)}
+                      placeholder="New alias"
+                      value={aliasValue}
+                    />
+                    <button disabled={aliasSaving || !aliasValue.trim()} type="submit">
+                      {aliasSaving ? "Adding…" : "Add"}
+                    </button>
+                    <button
+                      aria-label="Cancel adding alias"
+                      className="alias-cancel"
+                      disabled={aliasSaving}
+                      onClick={() => {
+                        setAliasEditing(false);
+                        setAliasValue("");
+                        setAliasError(undefined);
+                      }}
+                      type="button"
+                    >
+                      <X size={12} />
+                    </button>
+                  </form>
+                ) : (
+                  <button
+                    aria-label="Add alias"
+                    className="alias-add-trigger"
+                    onClick={() => setAliasEditing(true)}
+                    title="Add alias"
+                    type="button"
+                  >
+                    <Plus size={12} />
+                    <span>Add alias</span>
+                  </button>
+                )}
+                <span
+                  aria-label="About aliases"
+                  className="alias-info"
+                  role="img"
+                  tabIndex={0}
+                  title="Ein Alias hilft, alternative Namen künftig dieser Entität zuzuordnen. Gibt es bereits genau eine Entität desselben Typs mit diesem Namen, werden die Knoten automatisch zusammengeführt. Das × entfernt den Alias wieder, macht eine frühere Zusammenführung aber nicht rückgängig."
+                >
+                  <Info size={13} />
+                </span>
+                {aliasError && <small className="alias-error" role="alert">{aliasError}</small>}
               </div>
-            )}
-
-            {node.type !== "Article" && profileTrace && (
-              <ProfileStatusRow profileTrace={profileTrace} />
             )}
           </section>
 
@@ -537,43 +678,212 @@ export function DetailsPanel({
   );
 }
 
-function ProfileStatusRow({ profileTrace }: { profileTrace: ProfileTraceReference }) {
+function EntityDescriptionReview({
+  nodeId,
+  description,
+  fallbackDescription,
+  profileTrace,
+  onRefresh,
+}: {
+  nodeId: string;
+  description?: string;
+  fallbackDescription: string;
+  profileTrace?: ProfileTraceReference;
+  onRefresh: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(description ?? fallbackDescription);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+  const humanStatus = profileTrace?.humanReviewStatus ?? "unreviewed";
   const hasWarning =
-    profileTrace.status === "needs_human_review" ||
-    profileTrace.decision === "possible_wrong_merge" ||
-    profileTrace.decision === "conflicting_evidence";
-  const StatusIcon = hasWarning ? AlertTriangle : CheckCircle2;
-  const summary = profileCurationSummary(profileTrace);
-  const tracedAt = profileTrace.tracedAt ? `Profile checked ${formatDateTime(profileTrace.tracedAt)}` : undefined;
+    humanStatus === "rejected" ||
+    profileTrace?.status === "needs_human_review" ||
+    profileTrace?.decision === "possible_wrong_merge" ||
+    profileTrace?.decision === "conflicting_evidence";
+  const stateClass =
+    humanStatus === "accepted"
+      ? "accepted"
+      : humanStatus === "rejected"
+        ? "rejected"
+        : hasWarning
+          ? "warning"
+          : "";
+  const StatusIcon =
+    humanStatus === "accepted" ? CheckCircle2 : hasWarning ? AlertTriangle : Info;
+  const statusSummary = entityDescriptionStatusSummary(profileTrace, Boolean(description));
+  const reviewedAt = profileTrace?.humanReviewedAt
+    ? `Human review ${formatDateTime(profileTrace.humanReviewedAt)}`
+    : profileTrace?.tracedAt
+      ? `Profile checked ${formatDateTime(profileTrace.tracedAt)}`
+      : undefined;
+
+  useEffect(() => {
+    setEditing(false);
+    setValue(description ?? fallbackDescription);
+    setSaving(false);
+    setError(undefined);
+  }, [description, fallbackDescription, nodeId]);
+
+  async function submitReview(
+    decision: EntityDescriptionReviewDecision,
+    editedDescription?: string,
+  ) {
+    setSaving(true);
+    setError(undefined);
+    try {
+      await api.reviewEntityDescription(nodeId, decision, editedDescription);
+      setEditing(false);
+      onRefresh();
+    } catch (reviewError) {
+      setError(
+        reviewError instanceof Error
+          ? reviewError.message
+          : "Entity description review failed",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
-    <div className={`profile-status-row ${hasWarning ? "warning" : ""}`}>
-      <div className="profile-status-copy">
+    <div className={`profile-status-row ${stateClass}`}>
+      <div className="profile-status-head">
         <div className="profile-status-title">
           <StatusIcon size={14} />
           <small>Entity description</small>
         </div>
-        <strong>{summary}</strong>
-        {tracedAt && <span>{tracedAt}</span>}
+        <div className="profile-review-actions" aria-label="Entity description review">
+          {profileTrace?.traceUrl && (
+            <a
+              aria-label="View entity description curation trace"
+              href={profileTrace.traceUrl}
+              rel="noreferrer"
+              target="_blank"
+              title="View curation trace"
+            >
+              <ExternalLink size={13} />
+            </a>
+          )}
+          {!editing && description && humanStatus !== "accepted" && (
+            <button
+              aria-label="Accept entity description"
+              disabled={saving}
+              onClick={() => void submitReview("accepted")}
+              title="Accept description"
+              type="button"
+            >
+              <Check size={13} />
+            </button>
+          )}
+          {!editing && description && humanStatus !== "rejected" && (
+            <button
+              aria-label="Reject entity description"
+              className="danger"
+              disabled={saving}
+              onClick={() => void submitReview("rejected")}
+              title="Reject description"
+              type="button"
+            >
+              <X size={13} />
+            </button>
+          )}
+          {!editing && (
+            <button
+              aria-label="Edit entity description"
+              disabled={saving}
+              onClick={() => {
+                setEditing(true);
+                setError(undefined);
+              }}
+              title="Edit description"
+              type="button"
+            >
+              <Pencil size={13} />
+            </button>
+          )}
+          {!editing && humanStatus !== "unreviewed" && (
+            <button
+              aria-label="Reset entity description review"
+              disabled={saving}
+              onClick={() => void submitReview("unreviewed")}
+              title="Reset review"
+              type="button"
+            >
+              <RotateCcw size={13} />
+            </button>
+          )}
+        </div>
       </div>
 
-      <div className="profile-status-actions">
-        {profileTrace.traceUrl ? (
-          <a
-            className="claim-trace-link"
-            href={profileTrace.traceUrl}
-            target="_blank"
-            rel="noreferrer"
-            title={profileTrace.traceUrl}
-          >
-            <ExternalLink size={13} />
-            <span>View curation trace</span>
-          </a>
-        ) : (
-          <small>Trace unavailable</small>
+      {editing ? (
+        <form
+          className="profile-description-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitReview("accepted", value.trim());
+          }}
+        >
+          <textarea
+            aria-label="Entity description"
+            autoFocus
+            disabled={saving}
+            maxLength={4000}
+            onChange={(event) => setValue(event.target.value)}
+            rows={5}
+            value={value}
+          />
+          <div>
+            <button disabled={saving || !value.trim()} type="submit">
+              {saving ? "Saving…" : "Save & accept"}
+            </button>
+            <button
+              className="secondary"
+              disabled={saving}
+              onClick={() => {
+                setEditing(false);
+                setValue(description ?? fallbackDescription);
+                setError(undefined);
+              }}
+              type="button"
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : (
+        <p className="profile-description-text">{description ?? fallbackDescription}</p>
+      )}
+
+      <div className="profile-status-copy">
+        <strong>{statusSummary}</strong>
+        {reviewedAt && <span>{reviewedAt}</span>}
+        {!description && (
+          <span>The displayed synopsis is generated from graph context until you save a description.</span>
+        )}
+        {error && (
+          <span className="profile-review-error" role="alert">
+            {error}
+          </span>
         )}
       </div>
     </div>
   );
+}
+
+function entityDescriptionStatusSummary(
+  profileTrace: ProfileTraceReference | undefined,
+  hasDescription: boolean,
+): string {
+  if (!hasDescription) return "No stored description yet.";
+  if (profileTrace?.humanReviewStatus === "accepted") {
+    return "Accepted by human review.";
+  }
+  if (profileTrace?.humanReviewStatus === "rejected") {
+    return "Rejected by human review. The text remains visible and can be edited.";
+  }
+  if (profileTrace) return profileCurationSummary(profileTrace);
+  return "Not yet reviewed.";
 }
 
 function EntityExtractionSection({
@@ -868,7 +1178,6 @@ function ClaimCard({
   const primaryArticle = primaryHistoryArticle(history);
   const primary = primaryAssertion(claim);
   const evidence = primaryArticle?.evidence ?? primary?.evidence;
-  const evidenceLabel = "Evidence";
   const articleTitle =
     articleDisplayTitle(primaryArticle?.article_title || primaryArticle?.article_url) ??
     articleDisplayTitle(primary?.article_title || primary?.article_url);
@@ -915,12 +1224,7 @@ function ClaimCard({
           </p>
         )}
 
-        {evidence && (
-          <blockquote className="claim-evidence">
-            <span>{evidenceLabel}</span>
-            <q>{evidence}</q>
-          </blockquote>
-        )}
+        {evidence && <ClaimEvidence evidence={evidence} />}
 
         <div className="claim-footer">
           <div className="claim-actions">
@@ -957,6 +1261,34 @@ function ClaimCard({
         </div>
       </div>
     </article>
+  );
+}
+
+function ClaimEvidence({ evidence }: { evidence: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const collapsible = evidence.trim().length > COLLAPSIBLE_EVIDENCE_CHAR_LIMIT;
+
+  useEffect(() => {
+    setExpanded(false);
+  }, [evidence]);
+
+  return (
+    <blockquote className="claim-evidence">
+      <span>Evidence</span>
+      <q className={`claim-evidence-text ${collapsible && !expanded ? "collapsed" : ""}`}>
+        {evidence}
+      </q>
+      {collapsible && (
+        <button
+          aria-expanded={expanded}
+          className="claim-evidence-toggle"
+          onClick={() => setExpanded((current) => !current)}
+          type="button"
+        >
+          {expanded ? "Show less" : "Show full evidence"}
+        </button>
+      )}
+    </blockquote>
   );
 }
 
@@ -1244,7 +1576,13 @@ function buildProfileTraceReference(node?: GraphNode): ProfileTraceReference | u
   const experimentId = stringValue(node.properties.description_mlflow_experiment_id);
   const traceUrl = stringValue(node.properties.description_trace_url) ?? fallbackMlflowTraceUrl(traceId, experimentId);
   const tracedAt = stringValue(node.properties.description_traced_at);
-  const hasCurationSignal = Boolean(status || decision || traceId || traceUrl || tracedAt);
+  const humanReviewStatus = stringValue(
+    node.properties.description_human_review_status,
+  ) as EntityDescriptionReviewDecision | undefined;
+  const humanReviewedAt = stringValue(node.properties.description_human_reviewed_at);
+  const hasCurationSignal = Boolean(
+    status || decision || traceId || traceUrl || tracedAt || humanReviewStatus || humanReviewedAt,
+  );
   if (!hasCurationSignal) return undefined;
   const profileTrace: ProfileTraceReference = {
     status,
@@ -1254,6 +1592,8 @@ function buildProfileTraceReference(node?: GraphNode): ProfileTraceReference | u
     experimentId,
     traceUrl,
     tracedAt,
+    humanReviewStatus,
+    humanReviewedAt,
   };
   return Object.values(profileTrace).some((value) => Boolean(value)) ? profileTrace : undefined;
 }
@@ -1599,4 +1939,8 @@ function formatMoney(amount?: number, currency?: string): string {
   } catch {
     return `${Math.round(amount).toLocaleString("en-GB")} ${code}`;
   }
+}
+
+function normalizeAliasName(value: unknown): string {
+  return typeof value === "string" ? value.trim().replace(/\s+/g, " ").toLocaleLowerCase() : "";
 }

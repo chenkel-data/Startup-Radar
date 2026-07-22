@@ -99,6 +99,24 @@ export type SearchResult = {
   score: number;
   aliases: string[];
   description?: string;
+  roles: string[];
+};
+
+export type EntityAliasResult = {
+  node_id: string;
+  name: string;
+  aliases: string[];
+  merged_node_ids: string[];
+};
+
+export type EntityDescriptionReviewDecision = "accepted" | "rejected" | "unreviewed";
+
+export type EntityDescriptionReviewResult = {
+  node_id: string;
+  description: string;
+  description_source?: string;
+  human_review_status: EntityDescriptionReviewDecision;
+  reviewed_at?: string;
 };
 
 export type TaskStatus = {

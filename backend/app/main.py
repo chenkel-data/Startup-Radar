@@ -78,6 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.entity_profile_store = entity_profile_store
     app.state.article_graph_writer = article_graph_writer
     app.state.llm = llm
+    app.state.embedding = embedding
     app.state.scraper = scraper
     app.state.ingestion = IngestionService(
         settings=settings,

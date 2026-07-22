@@ -134,8 +134,10 @@ function resolveMetric(row: InsightRow): { value: string; label: string } {
   const investments = numberValue(row.investments);
   if (investments !== undefined) return { value: String(investments), label: "investments" };
 
-  const sharedStartups = numberValue(row.shared_startups);
-  if (sharedStartups !== undefined) return { value: String(sharedStartups), label: "shared startups" };
+  const sharedOrganizations = numberValue(row.shared_organizations);
+  if (sharedOrganizations !== undefined) {
+    return { value: String(sharedOrganizations), label: "shared investments" };
+  }
 
   const rounds = numberValue(row.rounds);
   if (rounds !== undefined) return { value: String(rounds), label: "rounds" };

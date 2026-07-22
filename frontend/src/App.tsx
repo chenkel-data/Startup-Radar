@@ -9,6 +9,7 @@ import { DetailsPanel } from "./components/DetailsPanel";
 import { ApiError, api } from "./lib/api";
 import type {
   EntityCounts,
+  EntityAliasResult,
   GraphNode,
   GraphResponse,
   SearchResult,
@@ -177,6 +178,23 @@ export default function App() {
     }
   }
 
+  const handleEntityUpdated = useCallback(
+    async (result: EntityAliasResult) => {
+      const mergedIds = new Set(result.merged_node_ids);
+      setResults((current) =>
+        current
+          .filter((entry) => !mergedIds.has(entry.id))
+          .map((entry) =>
+            entry.id === result.node_id
+              ? { ...entry, name: result.name, aliases: result.aliases }
+              : entry,
+          ),
+      );
+      await loadGraph(result.name);
+    },
+    [loadGraph],
+  );
+
   const typeCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const node of graph.nodes) {
@@ -287,6 +305,7 @@ export default function App() {
           onOpenGraph={(name) => {
             void loadGraph(name);
           }}
+          onEntityUpdated={handleEntityUpdated}
           onNodeSelect={selectNode}
         />
       </div>

@@ -41,6 +41,122 @@ class EntityProfileStore:
     def __init__(self, neo4j: Neo4jClient):
         self.neo4j = neo4j
 
+    async def description_review_input(self, entity_id: str) -> dict[str, Any] | None:
+        query = """
+        MATCH (n {id: $entity_id})
+        WHERE any(label IN labels(n) WHERE label IN $entity_labels)
+        RETURN n.id AS id,
+               head([label IN labels(n) WHERE label IN $entity_labels]) AS label,
+               n.name AS name,
+               n.canonical_name AS canonical_name,
+               n.aliases AS aliases,
+               n.description AS current_description
+        LIMIT 1
+        """
+        async with self.neo4j.session() as session:
+            result = await session.run(
+                query,
+                entity_id=entity_id,
+                entity_labels=PROFILE_ENTITY_LABELS,
+            )
+            record = await result.single()
+            return jsonable(dict(record)) if record else None
+
+    async def review_description(
+        self,
+        *,
+        entity_id: str,
+        decision: str,
+        description: str | None,
+        comment: str | None,
+        reviewer: str | None,
+        embedding: list[float] | None = None,
+        embedding_input_hash: str | None = None,
+        embedding_model: str | None = None,
+    ) -> dict[str, Any] | None:
+        reviewed_at = datetime.now(UTC)
+        review_event = json.dumps(
+            {
+                "decision": decision,
+                "description": description,
+                "comment": comment,
+                "reviewer": reviewer,
+                "reviewed_at": reviewed_at.isoformat(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        query = """
+        MATCH (n {id: $entity_id})
+        WHERE any(label IN labels(n) WHERE label IN $entity_labels)
+        WITH n,
+             coalesce(n.description_profile_revision, 0)
+               + CASE WHEN $description IS NULL THEN 0 ELSE 1 END AS revision
+        SET n.updated_at = datetime(),
+            n.description_human_review_status = $decision,
+            n.description_human_review_comment = $comment,
+            n.description_human_reviewed_by = $reviewer,
+            n.description_human_reviewed_at = datetime($reviewed_at),
+            n.description_human_review_history =
+              coalesce(n.description_human_review_history, []) + [$review_event],
+            n.description = CASE
+              WHEN $description IS NULL THEN n.description ELSE $description
+            END,
+            n.description_source = CASE
+              WHEN $description IS NULL THEN n.description_source ELSE "human"
+            END,
+            n.description_profile_revision = revision,
+            n.description_curation_status = CASE
+              WHEN $description IS NULL THEN n.description_curation_status
+              ELSE "human_accepted"
+            END,
+            n.description_curated_at = CASE
+              WHEN $description IS NULL THEN n.description_curated_at ELSE datetime($reviewed_at)
+            END,
+            n.embedding = CASE
+              WHEN $description IS NULL THEN n.embedding ELSE $embedding
+            END,
+            n.embedding_input_hash = CASE
+              WHEN $description IS NULL THEN n.embedding_input_hash ELSE $embedding_input_hash
+            END,
+            n.embedding_profile_revision = CASE
+              WHEN $description IS NULL THEN n.embedding_profile_revision
+              WHEN $embedding IS NULL THEN NULL
+              ELSE revision
+            END,
+            n.embedding_model = CASE
+              WHEN $description IS NULL THEN n.embedding_model ELSE $embedding_model
+            END,
+            n.embedding_updated_at = CASE
+              WHEN $description IS NULL THEN n.embedding_updated_at
+              WHEN $embedding IS NULL THEN NULL
+              ELSE datetime($reviewed_at)
+            END
+        RETURN n.id AS node_id,
+               n.description AS description,
+               n.description_source AS description_source,
+               n.description_human_review_status AS human_review_status,
+               n.description_human_reviewed_at AS reviewed_at
+        LIMIT 1
+        """
+        async with self.neo4j.session() as session:
+            result = await session.run(
+                query,
+                entity_id=entity_id,
+                entity_labels=PROFILE_ENTITY_LABELS,
+                decision=decision,
+                description=description,
+                comment=comment,
+                reviewer=reviewer,
+                reviewed_at=reviewed_at.isoformat(),
+                review_event=review_event,
+                embedding=embedding,
+                embedding_input_hash=embedding_input_hash,
+                embedding_model=embedding_model,
+            )
+            record = await result.single()
+            return jsonable(dict(record)) if record else None
+
     async def profile_review_inputs(
         self,
         *,

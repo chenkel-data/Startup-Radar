@@ -1,5 +1,8 @@
 import type {
+  EntityAliasResult,
   EntityCounts,
+  EntityDescriptionReviewDecision,
+  EntityDescriptionReviewResult,
   GraphResponse,
   InsightRow,
   NodeClaimsResponse,
@@ -48,6 +51,35 @@ export const api = {
 
   nodeClaims(nodeId: string) {
     return request<NodeClaimsResponse>(`/nodes/${encodeURIComponent(nodeId)}/claims`);
+  },
+
+  addEntityAlias(nodeId: string, alias: string) {
+    return request<EntityAliasResult>(`/nodes/${encodeURIComponent(nodeId)}/aliases`, {
+      method: "POST",
+      body: JSON.stringify({ alias }),
+    });
+  },
+
+  removeEntityAlias(nodeId: string, alias: string) {
+    const params = new URLSearchParams({ alias });
+    return request<EntityAliasResult>(
+      `/nodes/${encodeURIComponent(nodeId)}/aliases?${params.toString()}`,
+      { method: "DELETE" },
+    );
+  },
+
+  reviewEntityDescription(
+    nodeId: string,
+    decision: EntityDescriptionReviewDecision,
+    description?: string,
+  ) {
+    return request<EntityDescriptionReviewResult>(
+      `/nodes/${encodeURIComponent(nodeId)}/description/review`,
+      {
+        method: "POST",
+        body: JSON.stringify({ decision, description }),
+      },
+    );
   },
 
   reviewClaim(

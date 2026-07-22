@@ -6,6 +6,8 @@ import { api } from "./lib/api";
 import type { GraphNode, GraphResponse, SearchResult } from "./types/graph";
 
 const apiMock = vi.hoisted(() => ({
+  addEntityAlias: vi.fn(),
+  removeEntityAlias: vi.fn(),
   graph: vi.fn(),
   nodeClaims: vi.fn(),
   reviewClaim: vi.fn(),
@@ -110,6 +112,7 @@ const searchResult: SearchResult = {
   type: "Startup",
   score: 12.5,
   aliases: [],
+  roles: [],
 };
 
 describe("App graph exploration", () => {
@@ -122,6 +125,12 @@ describe("App graph exploration", () => {
     });
     vi.mocked(api.search).mockResolvedValue([searchResult]);
     vi.mocked(api.nodeClaims).mockResolvedValue({ node_id: "", claims: [], mentions: [] });
+    vi.mocked(api.addEntityAlias).mockResolvedValue({
+      node_id: aveliosNode.id,
+      name: aveliosNode.label,
+      aliases: ["Avelios"],
+      merged_node_ids: [],
+    });
     vi.mocked(api.clearGraph).mockResolvedValue({ status: "ok", deleted_nodes: 0 });
     vi.mocked(api.entityCounts).mockResolvedValue({
       Startup: 0,

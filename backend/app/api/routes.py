@@ -2,6 +2,10 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 
 from app.models.extraction import (
     ClaimReviewIn,
+    EntityAliasIn,
+    EntityAliasResult,
+    EntityDescriptionReviewIn,
+    EntityDescriptionReviewResult,
     FeedbackIn,
     GraphResponse,
     IngestRequest,
@@ -11,8 +15,11 @@ from app.models.extraction import (
 from app.observability import log_extraction_feedback
 from app.graph.admin_store import AdminStore
 from app.graph.claim_store import ClaimStore
+from app.graph.entity_profile_store import EntityProfileStore
+from app.graph.entity_resolution_store import AmbiguousAliasError, EntityResolutionStore
 from app.graph.graph_read_store import GraphReadStore
 from app.graph.insight_store import InsightStore
+from app.services.entity_curation import profile_embedding_input_hash, profile_embedding_text
 from app.services.ingestion import IngestionService
 from app.services.tasks import TaskManager
 
@@ -25,6 +32,14 @@ def _admin(request: Request) -> AdminStore:
 
 def _claims(request: Request) -> ClaimStore:
     return request.app.state.claim_store
+
+
+def _entity_resolution(request: Request) -> EntityResolutionStore:
+    return request.app.state.entity_resolution_store
+
+
+def _entity_profiles(request: Request) -> EntityProfileStore:
+    return request.app.state.entity_profile_store
 
 
 def _graph_read(request: Request) -> GraphReadStore:
@@ -78,7 +93,7 @@ async def start_ingest(
 @router.get("/ingest/{task_id}", response_model=TaskStatus)
 async def ingest_status(request: Request, task_id: str) -> TaskStatus:
     status = _tasks(request).get(task_id)
-    if not status:
+    if not status or status.name != "ingest":
         raise HTTPException(status_code=404, detail="Task not found")
     return status
 
@@ -107,9 +122,7 @@ async def investor(request: Request, name: str) -> dict:
         profile = await graph.entity_profile(label, name)
         if not profile:
             continue
-        if label == "Investor" or any(
-            item.get("relationship") == "INVESTED_IN" for item in profile.get("related", [])
-        ):
+        if "investor" in profile.get("roles", []):
             return profile
     raise HTTPException(status_code=404, detail="Investor not found")
 
@@ -142,6 +155,84 @@ async def node_claims(request: Request, node_id: str) -> dict:
     if not claims:
         raise HTTPException(status_code=404, detail="Node not found")
     return claims
+
+
+@router.post("/nodes/{node_id}/aliases", response_model=EntityAliasResult)
+async def add_entity_alias(
+    request: Request,
+    node_id: str,
+    body: EntityAliasIn,
+) -> EntityAliasResult:
+    try:
+        result = await _entity_resolution(request).add_alias(node_id, body.alias)
+    except AmbiguousAliasError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return EntityAliasResult.model_validate(result)
+
+
+@router.delete("/nodes/{node_id}/aliases", response_model=EntityAliasResult)
+async def remove_entity_alias(
+    request: Request,
+    node_id: str,
+    alias: str = Query(min_length=1, max_length=200),
+) -> EntityAliasResult:
+    try:
+        result = await _entity_resolution(request).remove_alias(node_id, alias)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return EntityAliasResult.model_validate(result)
+
+
+@router.post(
+    "/nodes/{node_id}/description/review",
+    response_model=EntityDescriptionReviewResult,
+)
+async def review_entity_description(
+    request: Request,
+    node_id: str,
+    body: EntityDescriptionReviewIn,
+) -> EntityDescriptionReviewResult:
+    store = _entity_profiles(request)
+    entity = await store.description_review_input(node_id)
+    if entity is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    if body.description is None and not str(entity.get("current_description") or "").strip():
+        raise HTTPException(status_code=400, detail="Entity has no description to review")
+
+    embedding = None
+    embedding_input_hash = None
+    embedding_model = None
+    embedding_service = request.app.state.embedding
+    if body.description is not None and embedding_service is not None:
+        embedding_text = profile_embedding_text(entity, body.description)
+        embedding = await embedding_service.embed_one(embedding_text)
+        embedding_input_hash = profile_embedding_input_hash(entity, body.description)
+        settings = request.app.state.settings
+        embedding_model = (
+            settings.embedding_st_model
+            if settings.embedding_provider == "sentence-transformers"
+            else settings.embedding_model
+        )
+
+    result = await store.review_description(
+        entity_id=node_id,
+        decision=body.decision,
+        description=body.description,
+        comment=body.comment,
+        reviewer=body.reviewer,
+        embedding=embedding,
+        embedding_input_hash=embedding_input_hash,
+        embedding_model=embedding_model,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return EntityDescriptionReviewResult.model_validate(result)
 
 
 @router.post("/claims/review")
@@ -196,10 +287,8 @@ async def topic_clusters(
 async def trace_feedback(trace_id: str, body: FeedbackIn) -> dict:
     """Attach a human assessment to one MLflow trace.
 
-    Shows up in the trace's **Assessments** tab in the MLflow UI. Used by
-    the frontend's "Flag this trace" affordance. Non-fatal if MLflow is
-    disabled — returns ``{status: "skipped"}`` so the caller can still
-    show a friendly UI message.
+    The assessment appears in the trace's **Assessments** tab in MLflow.
+    When MLflow is disabled, the endpoint returns ``{status: "skipped"}``.
     """
     if not trace_id.strip():
         raise HTTPException(status_code=400, detail="trace_id is required")

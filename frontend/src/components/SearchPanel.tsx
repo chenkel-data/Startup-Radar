@@ -57,7 +57,10 @@ export function SearchPanel({ results, loading, onSearch, onSelect }: Props) {
             <span className={`type-dot ${result.type.toLowerCase()}`} />
             <span className="result-main">
               <strong>{result.name}</strong>
-              <small>{result.type}</small>
+              <small>
+                {result.type}
+                {result.roles.length > 0 ? ` · ${result.roles.join(", ")}` : ""}
+              </small>
             </span>
             <span className="score-pill">{formatScore(result.score)}</span>
           </button>
@@ -75,4 +78,3 @@ function formatScore(score: number): string {
   if (score >= 100) return Math.round(score).toString();
   return score.toFixed(2);
 }
-

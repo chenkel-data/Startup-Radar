@@ -6,6 +6,9 @@ import { api } from "../lib/api";
 import type { GraphNode, GraphResponse, NodeClaim, NodeClaimsResponse } from "../types/graph";
 
 const apiMock = vi.hoisted(() => ({
+  addEntityAlias: vi.fn(),
+  removeEntityAlias: vi.fn(),
+  reviewEntityDescription: vi.fn(),
   nodeClaims: vi.fn(),
   reviewClaim: vi.fn(),
 }));
@@ -51,6 +54,9 @@ const graph: GraphResponse = {
     },
   ],
 };
+
+const LONG_EVIDENCE =
+  "Helsing setzt auf KI-Fähigkeiten für den Sicherheits- und Verteidigungsbereich und wurde 2021 von Torsten Reil, Niklas Köhler und Gundbert Scherf gegründet. Mit dem frischen Kapital möchte das Unternehmen seine Mission beschleunigen und neue KI-Plattformen entwickeln.";
 
 function reviewClaim(): NodeClaim {
   return {
@@ -137,6 +143,26 @@ function supportedClaim(): NodeClaim {
     ],
     source_id: "company:sap",
     target_id: "topic:kuenstliche-intelligenz",
+  };
+}
+
+function longEvidenceClaim(): NodeClaim {
+  const claim = supportedClaim();
+  return {
+    ...claim,
+    edge_id: "edge-long-evidence",
+    source_articles: [
+      {
+        ...claim.source_articles![0],
+        evidence: LONG_EVIDENCE,
+      },
+    ],
+    assertions: [
+      {
+        ...claim.assertions[0],
+        evidence: LONG_EVIDENCE,
+      },
+    ],
   };
 }
 
@@ -334,6 +360,7 @@ function claimsResponse(claims: NodeClaim[], mentions: NodeClaim[] = []): NodeCl
 
 function renderDetailsPanel() {
   const onOpenGraph = vi.fn();
+  const onEntityUpdated = vi.fn();
   const onNodeSelect = vi.fn();
   render(
     <DetailsPanel
@@ -342,16 +369,115 @@ function renderDetailsPanel() {
       visibleTypes={new Set(["Company", "Startup", "Topic"])}
       visibleRelations={new Set(["ACQUIRED", "HAS_TOPIC"])}
       onOpenGraph={onOpenGraph}
+      onEntityUpdated={onEntityUpdated}
       onNodeSelect={onNodeSelect}
     />,
   );
-  return { onOpenGraph, onNodeSelect };
+  return { onOpenGraph, onEntityUpdated, onNodeSelect };
 }
 
 describe("DetailsPanel claim review behavior", () => {
   beforeEach(() => {
     vi.mocked(api.nodeClaims).mockResolvedValue(claimsResponse([reviewClaim(), supportedClaim()]));
     vi.mocked(api.reviewClaim).mockResolvedValue({ status: "ok", decision: "accepted" });
+    vi.mocked(api.addEntityAlias).mockResolvedValue({
+      node_id: sapNode.id,
+      name: sapNode.label,
+      aliases: ["SAP SE"],
+      merged_node_ids: [],
+    });
+    vi.mocked(api.removeEntityAlias).mockResolvedValue({
+      node_id: sapNode.id,
+      name: sapNode.label,
+      aliases: [],
+      merged_node_ids: [],
+    });
+    vi.mocked(api.reviewEntityDescription).mockResolvedValue({
+      node_id: sapNode.id,
+      description: "SAP is a company.",
+      description_source: "curated_llm",
+      human_review_status: "accepted",
+      reviewed_at: "2026-07-28T09:00:00Z",
+    });
+  });
+
+  it("saves an inline description edit as accepted", async () => {
+    const user = userEvent.setup();
+    const { onOpenGraph } = renderDetailsPanel();
+
+    await user.click(screen.getByRole("button", { name: "Edit entity description" }));
+    const editor = screen.getByRole("textbox", { name: "Entity description" });
+    await user.clear(editor);
+    await user.type(editor, "SAP entwickelt Unternehmenssoftware.");
+    await user.click(screen.getByRole("button", { name: "Save & accept" }));
+
+    await waitFor(() =>
+      expect(api.reviewEntityDescription).toHaveBeenCalledWith(
+        "company:sap",
+        "accepted",
+        "SAP entwickelt Unternehmenssoftware.",
+      ),
+    );
+    expect(onOpenGraph).toHaveBeenCalledWith("SAP");
+  });
+
+  it("keeps a rejected description visible and allows resetting its review", async () => {
+    const user = userEvent.setup();
+    const onOpenGraph = vi.fn();
+    const node: GraphNode = {
+      ...sapNode,
+      properties: {
+        ...sapNode.properties,
+        description_human_review_status: "rejected",
+        description_human_reviewed_at: "2026-07-28T09:00:00Z",
+      },
+    };
+    render(
+      <DetailsPanel
+        node={node}
+        graph={{ ...graph, nodes: [node, priorLabsNode, aiNode] }}
+        visibleTypes={new Set(["Company", "Startup", "Topic"])}
+        visibleRelations={new Set(["ACQUIRED", "HAS_TOPIC"])}
+        onOpenGraph={onOpenGraph}
+        onEntityUpdated={vi.fn()}
+        onNodeSelect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("SAP is a company.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Reset entity description review" }));
+
+    await waitFor(() =>
+      expect(api.reviewEntityDescription).toHaveBeenCalledWith(
+        "company:sap",
+        "unreviewed",
+        undefined,
+      ),
+    );
+    expect(onOpenGraph).toHaveBeenCalledWith("SAP");
+  });
+
+  it("adds an alias and asks the app to refresh the entity", async () => {
+    const user = userEvent.setup();
+    const { onEntityUpdated } = renderDetailsPanel();
+
+    expect(screen.queryByLabelText("New alias")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("About aliases")).toHaveAttribute(
+      "title",
+      expect.stringMatching(/automatisch zusammengeführt/i),
+    );
+    await user.click(screen.getByRole("button", { name: "Add alias" }));
+    await user.type(screen.getByLabelText("New alias"), "SAP SE");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(api.addEntityAlias).toHaveBeenCalledWith("company:sap", "SAP SE"));
+    expect(onEntityUpdated).toHaveBeenCalledWith({
+      node_id: "company:sap",
+      name: "SAP",
+      aliases: ["SAP SE"],
+      merged_node_ids: [],
+    });
+    expect(screen.queryByLabelText("New alias")).not.toBeInTheDocument();
   });
 
   it("filters relationship claims by review, supported, and all", async () => {
@@ -378,7 +504,7 @@ describe("DetailsPanel claim review behavior", () => {
     const { onOpenGraph } = renderDetailsPanel();
 
     await screen.findByText("Conflicting direction");
-    await user.click(screen.getByRole("button", { name: /Accept/i }));
+    await user.click(screen.getByRole("button", { name: "Accept" }));
 
     await waitFor(() =>
       expect(api.reviewClaim).toHaveBeenCalledWith(
@@ -438,8 +564,8 @@ describe("DetailsPanel claim review behavior", () => {
     expect(screen.queryByText("Source evidence")).not.toBeInTheDocument();
     expect(screen.queryByText(/Published/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Earlier evidence/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Accept/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Reject/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeInTheDocument();
     expect(screen.queryByText(/Technical details/i)).not.toBeInTheDocument();
     expect(screen.queryByText("Older duplicate Bunch evidence.")).not.toBeInTheDocument();
   });
@@ -474,10 +600,10 @@ describe("DetailsPanel claim review behavior", () => {
     await screen.findByText("Rejected");
     expect(screen.getByText("Reviewed source")).toBeInTheDocument();
     expect(screen.queryByText("Wrong direction.")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Accept/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeInTheDocument();
     expect(screen.queryByText(/Technical details/i)).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: /Reset/i }));
+    await user.click(screen.getByRole("button", { name: "Reset" }));
 
     await waitFor(() =>
       expect(api.reviewClaim).toHaveBeenCalledWith(
