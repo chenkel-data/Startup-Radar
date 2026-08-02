@@ -1,4 +1,5 @@
 import type {
+  CurationPending,
   EntityAliasResult,
   EntityCounts,
   EntityDescriptionReviewDecision,
@@ -103,17 +104,30 @@ export const api = {
     return request<SearchResult[]>(`/search?q=${encodeURIComponent(query)}`);
   },
 
-  startIngest(maxPages: number) {
+  startIngest(maxPages: number, forceRescrape = false) {
     return request<TaskStatus>("/ingest", {
       method: "POST",
       body: JSON.stringify({
-        max_pages: maxPages
+        max_pages: maxPages,
+        force_rescrape: forceRescrape
       })
     });
   },
 
   ingestStatus(taskId: string) {
     return request<TaskStatus>(`/ingest/${taskId}`);
+  },
+
+  curationPending() {
+    return request<CurationPending>("/curation/pending");
+  },
+
+  startCuration() {
+    return request<TaskStatus>("/curation", { method: "POST" });
+  },
+
+  curationStatus(taskId: string) {
+    return request<TaskStatus>(`/curation/${taskId}`);
   },
 
   clearGraph() {

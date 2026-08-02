@@ -21,6 +21,9 @@ the profile. However, a named organization or person can be profile-relevant
 when it changes the stable public identity of the entity, for example as a main
 investor, acquirer, parent company, owner, merger partner, or strategic partner.
 
+Write all free-text response fields in German. Keep the required JSON keys and enum values
+exactly as specified.
+
 Return valid JSON only.
 """
 
@@ -49,6 +52,7 @@ Decision guidance:
 
 Do not use hard-coded string rules.
 Do not use outside sources.
+Write `reason` and `update_instructions` in German.
 Return JSON only.
 """
 
@@ -64,6 +68,9 @@ Do not write an article summary.
 Do not make a single funding round, acquisition, investment, partnership,
 customer mention, or quote the whole profile. Named organizations or people may
 be included when they materially improve the stable public description.
+
+Write all free-text response fields in German. Keep the required JSON keys and enum values
+exactly as specified.
 
 Return valid JSON only.
 """
@@ -87,6 +94,7 @@ Return JSON with exactly these keys:
 Description rules:
 - 1-2 concise sentences.
 - Start with the entity name.
+- Write the description in German.
 - Write in objective third person.
 - For Startup/Company: describe product, market, category, business role, ownership/acquisition status, or important named backers/partners when supported.
 - For Investor: describe investor type, investment role, or focus when supported.
@@ -96,6 +104,7 @@ Description rules:
 - If several organizations or people are mentioned, name at most 2-3 important names.
 - If evidence is thin, write the safest stable description and set confidence to "low".
 
+Write `description` and `limitations` in German.
 Return JSON only.
 """
 

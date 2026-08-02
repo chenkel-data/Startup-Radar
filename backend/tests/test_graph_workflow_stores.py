@@ -1,12 +1,15 @@
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from app.api.routes import review_entity_description
 from app.graph.admin_store import AdminStore
 from app.graph.claim_store import ClaimStore
 from app.graph.entity_profile_store import EntityProfileStore
 from app.graph.entity_resolution_store import EntityResolutionStore
+from app.models.extraction import EntityDescriptionReviewIn
 
 
 RecordBatch = dict[str, Any] | list[dict[str, Any]] | None
@@ -92,6 +95,40 @@ class FakeClaimStore:
         return 1
 
 
+class FakeProfileReviewStore:
+    def __init__(self) -> None:
+        self.saved: dict[str, Any] | None = None
+
+    async def description_review_input(self, entity_id: str) -> dict[str, Any]:
+        return {
+            "id": entity_id,
+            "label": "Company",
+            "name": "SAP",
+            "canonical_name": "SAP",
+            "aliases": ["SAP SE"],
+            "current_description": "SAP ist ein Softwareunternehmen.",
+        }
+
+    async def review_description(self, **kwargs: Any) -> dict[str, Any]:
+        self.saved = kwargs
+        return {
+            "node_id": kwargs["entity_id"],
+            "description": kwargs["description"],
+            "description_source": "human",
+            "human_review_status": kwargs["decision"],
+            "reviewed_at": "2026-07-28T09:00:00+00:00",
+        }
+
+
+class FakeEmbedding:
+    def __init__(self) -> None:
+        self.text: str | None = None
+
+    async def embed_one(self, text: str) -> list[float]:
+        self.text = text
+        return [0.1, 0.2]
+
+
 @pytest.mark.asyncio
 async def test_admin_apply_schema_runs_schema_and_claim_maintenance(monkeypatch) -> None:
     neo4j = FakeNeo4j()
@@ -160,41 +197,9 @@ async def test_profile_review_inputs_can_scope_to_resolved_entity_ids() -> None:
     assert params["entity_ids"] == ["company:sap"]
     assert params["profile_curation_policy_hash"] == "policy-1"
     assert "n.id IN $entity_ids" in query
-    assert "description_considered_article_policy_keys" in query
-    assert "considered_evidence.considered_profile_policy_hash" not in query
-    assert 'coalesce(evidence.considered_profile_policy_hash, "")' not in query
-    assert 'coalesce(evidence.article_id, "") <> ""' in query
-    assert 'NOT coalesce(evidence.article_id, "") IN considered_article_ids' not in query
-
-
-@pytest.mark.asyncio
-async def test_profile_review_keep_persists_article_policy_hash() -> None:
-    """Remember kept article evidence so the same policy does not review it again."""
-    neo4j = FakeNeo4j()
-    store = EntityProfileStore(neo4j)
-
-    await store.save_profile_review_keep(
-        entity_id="company:sap",
-        evidence_ids=["profile-evidence:1"],
-        article_ids=["article:1"],
-        profile_curation_policy_hash="policy-1",
-        review={
-            "decision": "keep_profile",
-            "confidence": "high",
-            "reason": "Already covered.",
-        },
-        model="gpt-test",
-    )
-
-    save_query, save_params = neo4j.sessions[0].runs[0]
-    mark_query, mark_params = neo4j.sessions[0].runs[1]
-    assert save_params["profile_curation_policy_hash"] == "policy-1"
-    assert save_params["article_policy_keys"] == ["article:1::policy-1"]
-    assert mark_params["profile_curation_policy_hash"] == "policy-1"
-    assert "n.description_curation_policy_hash" in save_query
-    assert "n.description_considered_article_policy_keys" in save_query
-    assert "article_policy_key IN $article_policy_keys" in save_query
-    assert "e.considered_profile_policy_hash" in mark_query
+    assert 'coalesce(n.description_source, "") <> "human"' in query
+    assert "NOT evidence.id IN considered_evidence_ids" in query
+    assert "evidence.ingested_profile_curation_policy_hashes" in query
 
 
 @pytest.mark.asyncio
@@ -224,15 +229,47 @@ async def test_profile_revision_persists_article_policy_hash() -> None:
         model="gpt-test",
     )
 
-    save_query, save_params = neo4j.sessions[0].runs[0]
-    mark_query, mark_params = neo4j.sessions[0].runs[1]
+    _save_query, save_params = neo4j.sessions[0].runs[0]
+    _mark_query, mark_params = neo4j.sessions[0].runs[1]
     assert save_params["profile_curation_policy_hash"] == "policy-1"
     assert save_params["article_policy_keys"] == ["article:1::policy-1"]
     assert mark_params["profile_curation_policy_hash"] == "policy-1"
-    assert "n.description_curation_policy_hash" in save_query
-    assert "n.description_considered_article_policy_keys" in save_query
-    assert "article_policy_key IN $article_policy_keys" in save_query
-    assert "e.considered_profile_policy_hash" in mark_query
+
+
+@pytest.mark.asyncio
+async def test_description_edit_refreshes_embedding_before_it_is_saved() -> None:
+    store = FakeProfileReviewStore()
+    embedding = FakeEmbedding()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                entity_profile_store=store,
+                embedding=embedding,
+                settings=SimpleNamespace(
+                    embedding_provider="openai",
+                    embedding_model="embedding-test",
+                    embedding_st_model="unused",
+                ),
+            )
+        )
+    )
+
+    result = await review_entity_description(
+        request,  # type: ignore[arg-type]
+        "company:sap",
+        EntityDescriptionReviewIn(
+            decision="accepted",
+            description="SAP entwickelt Unternehmenssoftware.",
+        ),
+    )
+
+    assert result.human_review_status == "accepted"
+    assert embedding.text is not None
+    assert "Public profile: SAP entwickelt Unternehmenssoftware." in embedding.text
+    assert store.saved is not None
+    assert store.saved["embedding"]
+    assert store.saved["embedding_input_hash"]
+    assert store.saved["embedding_model"] == "embedding-test"
 
 
 @pytest.mark.asyncio

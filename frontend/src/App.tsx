@@ -8,6 +8,7 @@ import { SearchPanel } from "./components/SearchPanel";
 import { DetailsPanel } from "./components/DetailsPanel";
 import { ApiError, api } from "./lib/api";
 import type {
+  CurationPending,
   EntityCounts,
   EntityAliasResult,
   GraphNode,
@@ -49,6 +50,8 @@ export default function App() {
   const [visibleRelations, setVisibleRelations] = useState(new Set(ALL_RELATIONS));
   const [maxPages, setMaxPages] = useState(2);
   const [task, setTask] = useState<TaskStatus | undefined>();
+  const [curationTask, setCurationTask] = useState<TaskStatus | undefined>();
+  const [curationPending, setCurationPending] = useState<CurationPending | undefined>();
   const [error, setError] = useState<string | undefined>();
   const [refreshKey, setRefreshKey] = useState(0);
   const [entityCounts, setEntityCounts] = useState<EntityCounts>({
@@ -64,6 +67,14 @@ export default function App() {
       setEntityCounts(await api.entityCounts());
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Entity count request failed");
+    }
+  }, []);
+
+  const loadCurationPending = useCallback(async () => {
+    try {
+      setCurationPending(await api.curationPending());
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Curation status request failed");
     }
   }, []);
 
@@ -89,7 +100,8 @@ export default function App() {
 
   useEffect(() => {
     void loadGraph();
-  }, [loadGraph]);
+    void loadCurationPending();
+  }, [loadGraph, loadCurationPending]);
 
   useEffect(() => {
     if (!task || (task.status !== "queued" && task.status !== "running")) return;
@@ -99,6 +111,7 @@ export default function App() {
         setTask(next);
         if (next.status === "succeeded") {
           void loadGraph();
+          void loadCurationPending();
         }
       } catch (exc) {
         if (exc instanceof ApiError && exc.status === 404) {
@@ -114,7 +127,36 @@ export default function App() {
       }
     }, 2200);
     return () => window.clearInterval(timer);
-  }, [task, loadGraph]);
+  }, [task, loadGraph, loadCurationPending]);
+
+  useEffect(() => {
+    if (
+      !curationTask
+      || (curationTask.status !== "queued" && curationTask.status !== "running")
+    ) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await api.curationStatus(curationTask.task_id);
+        setCurationTask(next);
+        if (next.status === "succeeded") {
+          void loadGraph();
+          void loadCurationPending();
+        }
+      } catch (exc) {
+        if (exc instanceof ApiError && exc.status === 404) {
+          setCurationTask({
+            ...curationTask,
+            status: "failed",
+            completed_at: new Date().toISOString(),
+            error: "Task no longer exists. The backend probably restarted; start curation again."
+          });
+          return;
+        }
+        setError(exc instanceof Error ? exc.message : "Curation polling failed");
+      }
+    }, 2200);
+    return () => window.clearInterval(timer);
+  }, [curationTask, loadGraph, loadCurationPending]);
 
   useEffect(() => {
     if (selectedNode && !visibleTypes.has(selectedNode.type)) {
@@ -152,13 +194,22 @@ export default function App() {
     }
   }
 
-  async function runIngest() {
+  async function runIngest(forceRescrape = false) {
     setError(undefined);
     try {
-      const next = await api.startIngest(maxPages);
+      const next = await api.startIngest(maxPages, forceRescrape);
       setTask(next);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Ingest failed");
+    }
+  }
+
+  async function runCuration() {
+    setError(undefined);
+    try {
+      setCurationTask(await api.startCuration());
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Curation failed");
     }
   }
 
@@ -171,6 +222,7 @@ export default function App() {
       setSelectedNode(undefined);
       setResults([]);
       setRefreshKey((value) => value + 1);
+      void loadCurationPending();
       return result;
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Clear failed");
@@ -266,9 +318,13 @@ export default function App() {
           <IngestControl
             maxPages={maxPages}
             onMaxPagesChange={setMaxPages}
-            onRun={runIngest}
+            onRun={() => void runIngest()}
+            onForceRun={() => void runIngest(true)}
             onClear={runClear}
             task={task}
+            curation={curationPending}
+            curationTask={curationTask}
+            onCurate={() => void runCuration()}
           />
 
           <FilterBar

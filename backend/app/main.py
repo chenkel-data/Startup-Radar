@@ -80,6 +80,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.llm = llm
     app.state.embedding = embedding
     app.state.scraper = scraper
+    app.state.profile_curation = profile_curation
     app.state.ingestion = IngestionService(
         settings=settings,
         scraper=scraper,
@@ -147,7 +148,11 @@ async def request_observability(request: Request, call_next):
 
 
 def _is_status_poll(method: str, path: str, status_code: int) -> bool:
-    return method in {"GET", "OPTIONS"} and path.startswith("/ingest/") and status_code < 400
+    return (
+        method in {"GET", "OPTIONS"}
+        and path.startswith(("/ingest/", "/curation/"))
+        and status_code < 400
+    )
 
 
 @app.get("/metrics")

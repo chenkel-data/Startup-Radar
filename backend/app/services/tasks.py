@@ -14,13 +14,36 @@ from app.models.extraction import TaskStatus
 WorkCallable = Callable[..., Awaitable[Any]]
 
 
+class TaskConflictError(RuntimeError):
+    def __init__(self, active_task: TaskStatus):
+        self.active_task = active_task
+        super().__init__(
+            f"{active_task.name.capitalize()} task {active_task.task_id} is already "
+            f"{active_task.status}"
+        )
+
+
 class TaskManager:
     def __init__(self):
         self._statuses: dict[str, TaskStatus] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self.logger = get_logger("tasks")
 
-    def start(self, name: str, work: WorkCallable) -> TaskStatus:
+    def start(
+        self,
+        name: str,
+        work: WorkCallable,
+        *,
+        exclusive_with: set[str] | frozenset[str] | None = None,
+    ) -> TaskStatus:
+        exclusive_names = exclusive_with or set()
+        for active_status in self._statuses.values():
+            if active_status.name in exclusive_names and active_status.status in {
+                "queued",
+                "running",
+            }:
+                raise TaskConflictError(active_status)
+
         task_id = str(uuid.uuid4())
         status = TaskStatus(
             task_id=task_id,
@@ -51,14 +74,16 @@ class TaskManager:
             result = await _invoke_work(work, task_id)
             status.status = "succeeded"
             status.result = _serialize_result(result)
+            extra = {
+                "event": "task",
+                "workflow_step": status.name,
+                "task_id": task_id,
+            }
+            if status.name != "ingest":
+                extra["detail"] = _result_summary(status.result)
             self.logger.info(
                 "task_succeeded",
-                extra={
-                    "event": "task",
-                    "workflow_step": status.name,
-                    "task_id": task_id,
-                    "detail": _result_summary(status.result),
-                },
+                extra=extra,
             )
         except Exception as exc:
             status.status = "failed"
@@ -103,10 +128,17 @@ def _result_summary(result: dict[str, Any] | None) -> str:
         return "no result payload"
     keys = [
         "articles_found",
+        "articles_cached",
+        "articles_scraped",
+        "articles_skipped",
         "articles_processed",
         "articles_failed",
         "entities_extracted",
         "relationships_created",
+        "candidate_entities",
+        "review_calls",
+        "rewrite_calls",
+        "cost_usd",
         "duration_ms",
     ]
     parts = [f"{key}={result[key]}" for key in keys if key in result]

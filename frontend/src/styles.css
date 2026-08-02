@@ -572,6 +572,49 @@ a {
   margin-top: 5px;
 }
 
+.cache-prompt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 9px;
+  padding: 8px;
+  border: 1px solid rgba(15, 118, 110, 0.24);
+  border-radius: 10px;
+  background: rgba(240, 253, 250, 0.76);
+  color: #0f5f58;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.cache-prompt > span {
+  min-width: 0;
+}
+
+.curation-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.curation-row > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.curation-row strong {
+  font-size: 0.8rem;
+}
+
+.curation-row .task-copy {
+  line-height: 1.35;
+}
+
 .clear-graph-row {
   display: flex;
   align-items: center;

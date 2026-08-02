@@ -18,6 +18,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.graph.entity_profile_store import EntityProfileStore
 from app.observability.context import current_trace_id as _current_trace_id
+from app.observability.costs import aggregate_llm_costs_for_job
 from app.observability.llm_steps import (
     LLM_STEP_PROFILE_CURATION,
     LLM_STEP_PROFILE_REVIEW,
@@ -54,7 +55,8 @@ _REVIEW_DECISIONS = {
 _CONFIDENCE_VALUES = {"high", "medium", "low"}
 _KEEP_DECISIONS = {"keep_profile", "insufficient_evidence"}
 _FLAG_DECISIONS = {"possible_wrong_merge", "conflicting_evidence"}
-_MAX_PROFILE_EVIDENCE_ARTICLES = 5
+PROFILE_CURATION_MIN_NEW_EVIDENCE = 3
+_MAX_PROFILE_EVIDENCE_TEXTS = 5
 _MAX_PROFILE_EVIDENCE_CHARS = 500
 _MAX_PROFILE_MATCHES = 3
 _MATCH_TEXT_PREVIEW_CHARS = 220
@@ -102,31 +104,93 @@ class EntityProfileCurationService:
             review_uri=self._profile_review_prompt_uri,
             curation_prompt=self._profile_curation_prompt,
             curation_uri=self._profile_curation_prompt_uri,
+            model=settings.openai_model,
+            temperature=getattr(settings, "openai_temperature", 0.0),
+            seed=getattr(settings, "openai_seed", 42),
         )
 
-    async def curate_profiles(
+    async def pending_summary(self) -> dict[str, Any]:
+        candidates = await self._load_candidates()
+        return _pending_curation_summary(
+            candidates,
+            policy_hash=self.profile_curation_policy_hash,
+        )
+
+    async def curate_pending_profiles(
         self,
-        outcome_rows: list[dict[str, Any]],
+        *,
+        job_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        _pop_openai_rate_limit_stats(self.llm)
+        candidates = await self._load_candidates(job_run_id=job_run_id)
+        before = _pending_curation_summary(
+            candidates,
+            policy_hash=self.profile_curation_policy_hash,
+        )
+        ready = [
+            candidate
+            for candidate in candidates
+            if _candidate_pending_evidence_count(candidate) >= PROFILE_CURATION_MIN_NEW_EVIDENCE
+        ]
+        tasks = [self._process_entity(entity, job_run_id=job_run_id) for entity in ready]
+        rows = await asyncio.gather(*tasks) if tasks else []
+        llm_cost_rows = (
+            aggregate_llm_costs_for_job(
+                settings=self.settings,
+                job_run_id=job_run_id,
+            )
+            if job_run_id
+            else []
+        )
+        after = await self.pending_summary()
+        rate_limit_stats = _pop_openai_rate_limit_stats(self.llm)
+
+        return {
+            "policy_hash": self.profile_curation_policy_hash,
+            "threshold": PROFILE_CURATION_MIN_NEW_EVIDENCE,
+            "candidate_entities": len(ready),
+            "review_calls": sum(
+                1 for row in llm_cost_rows if row.get("workflow_step") == "llm_profile_review"
+            ),
+            "rewrite_calls": sum(
+                1 for row in llm_cost_rows if row.get("workflow_step") == "llm_profile_curation"
+            ),
+            "kept": _status_count(rows, "kept"),
+            "updated": _status_count(rows, "updated"),
+            "exact_duplicates_skipped": _status_count(
+                rows,
+                "skipped_exact_duplicate_evidence",
+            ),
+            "needs_human_review": _status_count(rows, "needs_human_review"),
+            "failed": _status_count(rows, "failed"),
+            "input_tokens": sum(int(row.get("input_tokens") or 0) for row in llm_cost_rows),
+            "output_tokens": sum(int(row.get("output_tokens") or 0) for row in llm_cost_rows),
+            "cost_usd": round(
+                sum(float(row.get("total_cost_usd") or 0.0) for row in llm_cost_rows),
+                6,
+            ),
+            "duration_ms": round((perf_counter() - started) * 1000, 2),
+            "ready_entities_before": before["ready_entities"],
+            "waiting_entities_before": before["waiting_entities"],
+            "ready_entities_remaining": after["ready_entities"],
+            "waiting_entities_remaining": after["waiting_entities"],
+            "openai_rate_limit_events": rate_limit_stats["events"],
+        }
+
+    async def _load_candidates(
+        self,
         *,
         job_run_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        touched_ids = sorted({row["entity_id"] for row in outcome_rows if row.get("entity_id")})
-        self.logger.info(
-            "entity_profile_touched_entities_total",
-            extra={
-                "event": "curation",
-                "workflow_step": "touched_entities",
-                "count": len(touched_ids),
-            },
-        )
         with mlflow.start_span(name="load_profile_candidates", span_type=SpanType.TOOL) as span:
             _set_span_inputs(
                 span,
                 {
                     "job_run_id": job_run_id,
-                    "touched_entity_count": len(touched_ids),
-                    "candidate_scope": "all_graph_entities",
+                    "candidate_scope": "pending_graph_entities",
                     "profile_curation_policy_hash": self.profile_curation_policy_hash,
+                    "minimum_new_evidence": PROFILE_CURATION_MIN_NEW_EVIDENCE,
                 },
             )
             candidates = await self.profile_store.profile_review_inputs(
@@ -136,66 +200,6 @@ class EntityProfileCurationService:
                 span,
                 {
                     "candidate_count": len(candidates),
-                    "touched_candidates": sum(
-                        1 for candidate in candidates if candidate.get("id") in touched_ids
-                    ),
-                    "candidate_ids": [candidate.get("id") for candidate in candidates],
-                },
-            )
-        candidate_ids = {row.get("id") for row in candidates}
-        self.logger.info(
-            "entity_profile_candidates_loaded",
-            extra={
-                "event": "curation",
-                "workflow_step": "profile_candidates",
-                "count": len(candidates),
-                "detail": (
-                    f"touched={len(touched_ids)}, candidates={len(candidates)}, "
-                    f"touched_candidates={len(candidate_ids.intersection(touched_ids))}"
-                ),
-            },
-        )
-        tasks = [self._process_entity(entity, job_run_id=job_run_id) for entity in candidates]
-        return await asyncio.gather(*tasks) if tasks else []
-
-    async def curate_entity_ids(
-        self,
-        entity_ids: list[str],
-        *,
-        job_run_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        scoped_ids = sorted({entity_id for entity_id in entity_ids if entity_id})
-        if not scoped_ids:
-            return []
-
-        self.logger.info(
-            "entity_profile_touched_entities_total",
-            extra={
-                "event": "curation",
-                "workflow_step": "touched_entities",
-                "count": len(scoped_ids),
-            },
-        )
-        with mlflow.start_span(name="load_profile_candidates", span_type=SpanType.TOOL) as span:
-            _set_span_inputs(
-                span,
-                {
-                    "job_run_id": job_run_id,
-                    "touched_entity_count": len(scoped_ids),
-                    "candidate_scope": "resolved_entities",
-                    "entity_ids": scoped_ids,
-                    "profile_curation_policy_hash": self.profile_curation_policy_hash,
-                },
-            )
-            candidates = await self.profile_store.profile_review_inputs(
-                profile_curation_policy_hash=self.profile_curation_policy_hash,
-                entity_ids=scoped_ids,
-            )
-            _set_span_outputs(
-                span,
-                {
-                    "candidate_count": len(candidates),
-                    "touched_candidates": len(candidates),
                     "candidate_ids": [candidate.get("id") for candidate in candidates],
                 },
             )
@@ -206,13 +210,12 @@ class EntityProfileCurationService:
                 "workflow_step": "profile_candidates",
                 "count": len(candidates),
                 "detail": (
-                    f"scope=resolved_entities, touched={len(scoped_ids)}, "
-                    f"candidates={len(candidates)}"
+                    f"scope=pending_graph_entities, candidates={len(candidates)}, "
+                    f"threshold={PROFILE_CURATION_MIN_NEW_EVIDENCE}"
                 ),
             },
         )
-        tasks = [self._process_entity(entity, job_run_id=job_run_id) for entity in candidates]
-        return await asyncio.gather(*tasks) if tasks else []
+        return candidates
 
     async def _process_entity(
         self,
@@ -327,7 +330,7 @@ class EntityProfileCurationService:
                 "exact_duplicate_evidence_count": match_summary["exact_duplicate_count"],
                 "existing_considered_evidence_count": match_summary["existing_evidence_count"],
                 "prompt_evidence_count": len(profile_context["new_evidence"]),
-                "prompt_evidence_article_count": len(article_ref_map),
+                "prompt_evidence_article_count": len(set(article_ref_map.values())),
                 "best_existing_evidence_similarity": match_summary["best_similarity_score"],
                 "has_embedding": bool(entity.get("has_embedding")),
                 "previous_curation_trace_count": len(previous_curation_traces),
@@ -621,8 +624,8 @@ class EntityProfileCurationService:
             "decision": decision,
             "confidence": "high",
             "reason": (
-                "All new profile evidence exactly duplicates the current profile "
-                "or evidence that was already considered for this entity."
+                "Alle neuen Profilbelege entsprechen exakt dem aktuellen Profil "
+                "oder bereits für diese Entität berücksichtigten Belegen."
             ),
             "evidence_refs_considered": [],
             "update_instructions": [],
@@ -1087,7 +1090,7 @@ class EntityProfileCurationService:
         description: str,
     ) -> tuple[list[float] | None, str | None]:
         text = profile_embedding_text(entity, description)
-        input_hash = _hash_text(text)
+        input_hash = profile_embedding_input_hash(entity, description)
         if entity.get("has_embedding") and entity.get("embedding_input_hash") == input_hash:
             return None, None
         return await self._embedding_for_text(text), input_hash
@@ -1098,7 +1101,7 @@ class EntityProfileCurationService:
         description: str,
     ) -> tuple[list[float] | None, str | None]:
         text = profile_embedding_text(entity, description)
-        input_hash = _hash_text(text)
+        input_hash = profile_embedding_input_hash(entity, description)
         return await self._embedding_for_text(text), input_hash
 
     async def _embedding_for_text(self, text: str) -> list[float] | None:
@@ -1457,26 +1460,15 @@ def build_profile_evidence_match_summary(entity: dict[str, Any]) -> dict[str, An
 def build_profile_prompt_context(
     entity: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, str], list[dict[str, str]]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for evidence in entity.get("new_evidence") or []:
-        if not isinstance(evidence, dict):
-            continue
-        article_id = str(evidence.get("article_id") or "").strip()
-        text = str(evidence.get("text") or "").strip()
-        evidence_id = str(evidence.get("id") or "").strip()
-        if not article_id or not text or not evidence_id:
-            continue
-        grouped.setdefault(article_id, []).append(evidence)
-
-    groups = sorted(grouped.values(), key=_article_group_sort_key, reverse=True)[
-        :_MAX_PROFILE_EVIDENCE_ARTICLES
+    groups = _distinct_profile_evidence_groups(entity.get("new_evidence") or [])[
+        :_MAX_PROFILE_EVIDENCE_TEXTS
     ]
     prompt_evidence: list[dict[str, str]] = []
     evidence_sources: list[dict[str, str]] = []
     evidence_ref_map: dict[str, list[str]] = {}
     article_ref_map: dict[str, str] = {}
     for index, group in enumerate(groups, start=1):
-        selected = max(group, key=_evidence_revision_sort_key)
+        selected = group[0]
         ref = f"E{index}"
         article_url = str(selected.get("article_url") or "").strip()
         article_id = str(selected["article_id"])
@@ -1510,8 +1502,61 @@ def build_profile_prompt_context(
     return context, evidence_ref_map, article_ref_map, evidence_sources
 
 
-def _article_group_sort_key(group: list[dict[str, Any]]) -> str:
-    return max(_evidence_article_sort_key(evidence) for evidence in group)
+def _pending_curation_summary(
+    candidates: list[dict[str, Any]],
+    *,
+    policy_hash: str,
+) -> dict[str, Any]:
+    pending_counts = [_candidate_pending_evidence_count(candidate) for candidate in candidates]
+    ready_counts = [count for count in pending_counts if count >= PROFILE_CURATION_MIN_NEW_EVIDENCE]
+    waiting_counts = [
+        count for count in pending_counts if 0 < count < PROFILE_CURATION_MIN_NEW_EVIDENCE
+    ]
+    return {
+        "policy_hash": policy_hash,
+        "threshold": PROFILE_CURATION_MIN_NEW_EVIDENCE,
+        "ready_entities": len(ready_counts),
+        "waiting_entities": len(waiting_counts),
+        "ready_evidence": sum(ready_counts),
+        "waiting_evidence": sum(waiting_counts),
+    }
+
+
+def _candidate_pending_evidence_count(entity: dict[str, Any]) -> int:
+    match_summary = build_profile_evidence_match_summary(entity)
+    return len(_distinct_profile_evidence_groups(match_summary["new_evidence"]))
+
+
+def _distinct_profile_evidence_groups(
+    evidence_rows: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    valid_rows = [
+        evidence
+        for evidence in evidence_rows
+        if isinstance(evidence, dict)
+        and str(evidence.get("id") or "").strip()
+        and str(evidence.get("article_id") or "").strip()
+        and _normalized_evidence_text(evidence.get("text"))
+    ]
+    for evidence in sorted(valid_rows, key=_evidence_article_sort_key, reverse=True):
+        normalized = _normalized_evidence_text(evidence.get("text"))
+        matching_group = next(
+            (
+                group
+                for group in groups
+                if _same_evidence_text(
+                    normalized,
+                    _normalized_evidence_text(group[0].get("text")),
+                )
+            ),
+            None,
+        )
+        if matching_group is None:
+            groups.append([evidence])
+        else:
+            matching_group.append(evidence)
+    return groups
 
 
 def _evidence_article_sort_key(evidence: dict[str, Any]) -> str:
@@ -1523,14 +1568,16 @@ def _evidence_article_sort_key(evidence: dict[str, Any]) -> str:
     )
 
 
-def _evidence_revision_sort_key(evidence: dict[str, Any]) -> str:
-    return str(
-        evidence.get("last_seen_at")
-        or evidence.get("created_at")
-        or evidence.get("published_at")
-        or evidence.get("id")
-        or ""
-    )
+def _status_count(rows: list[dict[str, Any]], status: str) -> int:
+    return sum(1 for row in rows if row.get("status") == status)
+
+
+def _pop_openai_rate_limit_stats(llm: Any) -> dict[str, int]:
+    pop_stats = getattr(llm, "pop_openai_rate_limit_stats", None)
+    if pop_stats is None:
+        return {"events": 0}
+    stats = pop_stats()
+    return stats if isinstance(stats, dict) else {"events": 0}
 
 
 def _known_refs(
@@ -1673,9 +1720,11 @@ def _direct_update_review(evidence_refs: list[str]) -> dict[str, Any]:
     return {
         "decision": "update_profile",
         "confidence": "high",
-        "reason": "The entity has no current public profile.",
+        "reason": "Für die Entität liegt noch kein aktuelles öffentliches Profil vor.",
         "evidence_refs_considered": evidence_refs,
-        "update_instructions": ["Create a stable public profile from the provided evidence."],
+        "update_instructions": [
+            "Erstelle anhand der vorliegenden Belege ein stabiles öffentliches Profil."
+        ],
     }
 
 
@@ -1685,8 +1734,14 @@ def _profile_curation_policy_hash(
     review_uri: str,
     curation_prompt: Any,
     curation_uri: str,
+    model: str,
+    temperature: float,
+    seed: int | None,
 ) -> str:
     payload = {
+        "model": model,
+        "temperature": temperature,
+        "seed": seed,
         "profile_review": _prompt_policy_payload(
             review_prompt,
             review_uri,

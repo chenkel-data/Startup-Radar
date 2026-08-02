@@ -19,9 +19,14 @@ from app.graph.entity_profile_store import EntityProfileStore
 from app.graph.entity_resolution_store import AmbiguousAliasError, EntityResolutionStore
 from app.graph.graph_read_store import GraphReadStore
 from app.graph.insight_store import InsightStore
-from app.services.entity_curation import profile_embedding_input_hash, profile_embedding_text
+from app.services.entity_curation import (
+    PROFILE_CURATION_MIN_NEW_EVIDENCE,
+    EntityProfileCurationService,
+    profile_embedding_input_hash,
+    profile_embedding_text,
+)
 from app.services.ingestion import IngestionService
-from app.services.tasks import TaskManager
+from app.services.tasks import TaskConflictError, TaskManager
 
 router = APIRouter()
 
@@ -54,6 +59,10 @@ def _ingestion(request: Request) -> IngestionService:
     return request.app.state.ingestion
 
 
+def _profile_curation(request: Request) -> EntityProfileCurationService | None:
+    return request.app.state.profile_curation
+
+
 def _tasks(request: Request) -> TaskManager:
     return request.app.state.tasks
 
@@ -83,10 +92,14 @@ async def start_ingest(
     request: Request,
     payload: IngestRequest = Body(default_factory=IngestRequest),
 ) -> TaskStatus:
-    task = _tasks(request).start(
-        "ingest",
-        lambda task_id: _ingestion(request).ingest(payload, ingest_run_id=task_id),
-    )
+    try:
+        task = _tasks(request).start(
+            "ingest",
+            lambda task_id: _ingestion(request).ingest(payload, ingest_run_id=task_id),
+            exclusive_with={"ingest", "curation"},
+        )
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return task
 
 
@@ -94,6 +107,46 @@ async def start_ingest(
 async def ingest_status(request: Request, task_id: str) -> TaskStatus:
     status = _tasks(request).get(task_id)
     if not status or status.name != "ingest":
+        raise HTTPException(status_code=404, detail="Task not found")
+    return status
+
+
+@router.get("/curation/pending")
+async def curation_pending(request: Request) -> dict:
+    service = _profile_curation(request)
+    if service is None:
+        return {
+            "enabled": False,
+            "policy_hash": None,
+            "threshold": PROFILE_CURATION_MIN_NEW_EVIDENCE,
+            "ready_entities": 0,
+            "waiting_entities": 0,
+            "ready_evidence": 0,
+            "waiting_evidence": 0,
+        }
+    return {"enabled": True, **(await service.pending_summary())}
+
+
+@router.post("/curation", response_model=TaskStatus)
+async def start_curation(request: Request) -> TaskStatus:
+    service = _profile_curation(request)
+    if service is None:
+        raise HTTPException(status_code=409, detail="Entity description curation is disabled")
+    try:
+        task = _tasks(request).start(
+            "curation",
+            lambda task_id: service.curate_pending_profiles(job_run_id=task_id),
+            exclusive_with={"ingest", "curation"},
+        )
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return task
+
+
+@router.get("/curation/{task_id}", response_model=TaskStatus)
+async def curation_status(request: Request, task_id: str) -> TaskStatus:
+    status = _tasks(request).get(task_id)
+    if not status or status.name != "curation":
         raise HTTPException(status_code=404, detail="Task not found")
     return status
 

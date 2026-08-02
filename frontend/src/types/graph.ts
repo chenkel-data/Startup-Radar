@@ -130,4 +130,14 @@ export type TaskStatus = {
   result?: Record<string, unknown>;
 };
 
+export type CurationPending = {
+  enabled: boolean;
+  policy_hash?: string;
+  threshold: number;
+  ready_entities: number;
+  waiting_entities: number;
+  ready_evidence: number;
+  waiting_evidence: number;
+};
+
 export type InsightRow = Record<string, string | number | string[] | null>;

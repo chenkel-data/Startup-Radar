@@ -1,26 +1,52 @@
-import { Activity, Database, Loader2, Play, Trash2 } from "lucide-react";
+import {
+  Activity,
+  Database,
+  Loader2,
+  Play,
+  RefreshCcw,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
 import { useState } from "react";
 import { clamp } from "../lib/helpers";
-import type { TaskStatus } from "../types/graph";
+import type { CurationPending, TaskStatus } from "../types/graph";
 
 type Props = {
   maxPages: number;
   onMaxPagesChange: (value: number) => void;
   onRun: () => void;
+  onForceRun: () => void;
   onClear: () => Promise<{ deleted_nodes: number }>;
   task?: TaskStatus;
+  curation?: CurationPending;
+  curationTask?: TaskStatus;
+  onCurate: () => void;
 };
 
 export function IngestControl({
   maxPages,
   onMaxPagesChange,
   onRun,
+  onForceRun,
   onClear,
   task,
+  curation,
+  curationTask,
+  onCurate,
 }: Props) {
-  const running = task?.status === "queued" || task?.status === "running";
+  const ingestRunning = task?.status === "queued" || task?.status === "running";
+  const curationRunning =
+    curationTask?.status === "queued" || curationTask?.status === "running";
+  const workflowRunning = ingestRunning || curationRunning;
   const processed = task?.result?.articles_processed as number | undefined;
   const found = task?.result?.articles_found as number | undefined;
+  const cached = task?.result?.articles_cached as number | undefined;
+  const scraped = task?.result?.articles_scraped as number | undefined;
+  const skipped = task?.result?.articles_skipped as number | undefined;
+  const cacheMessage =
+    typeof task?.result?.cache_message === "string" ? task.result.cache_message : undefined;
+  const showCachePrompt =
+    task?.status === "succeeded" && Boolean(cacheMessage) && (skipped ?? 0) > 0;
   const safePages = clamp(maxPages, 1, 50);
 
   const [clearState, setClearState] = useState<"idle" | "confirm" | "clearing">("idle");
@@ -49,7 +75,8 @@ export function IngestControl({
   const statusLabel = task?.status ?? "idle";
   const statusCopy =
     statusLabel === "succeeded"
-      ? `${processed ?? 0} processed from ${found ?? 0} discovered`
+      ? `${processed ?? 0} processed, ${cached ?? 0} cached, `
+        + `${scraped ?? 0} scraped from ${found ?? 0} discovered`
       : statusLabel === "failed"
       ? task?.error ?? "Pipeline failed"
       : statusLabel === "running" || statusLabel === "queued"
@@ -63,9 +90,9 @@ export function IngestControl({
           <Database size={17} />
           <h2>Ingestion Pipeline</h2>
         </div>
-        <button className="command-button" onClick={onRun} disabled={running}>
-          {running ? <Loader2 size={17} className="spin" /> : <Play size={16} />}
-          <span>{running ? "Running" : "Start"}</span>
+        <button className="command-button" onClick={onRun} disabled={workflowRunning}>
+          {ingestRunning ? <Loader2 size={17} className="spin" /> : <Play size={16} />}
+          <span>{ingestRunning ? "Running" : "Start"}</span>
         </button>
       </div>
 
@@ -103,6 +130,16 @@ export function IngestControl({
         <span className="task-copy">{statusCopy}</span>
       </div>
 
+      {showCachePrompt && (
+        <div className="cache-prompt">
+          <span>{cacheMessage} Re-scrape anyway?</span>
+          <button className="ghost-mini" onClick={onForceRun} disabled={workflowRunning}>
+            <RefreshCcw size={14} />
+            <span>Re-scrape</span>
+          </button>
+        </div>
+      )}
+
       {task?.task_id && (
         <div className="task-status-line subtle">
           <Activity size={14} />
@@ -113,6 +150,40 @@ export function IngestControl({
       {task?.status === "failed" && task.error && (
         <div className="task-status-line subtle">
           <span className="error-text">{task.error}</span>
+        </div>
+      )}
+
+      <div className="curation-row">
+        <div>
+          <strong>Entity descriptions</strong>
+          <span className="task-copy">{curationStatusCopy(curation)}</span>
+        </div>
+        <button
+          className="ghost-mini"
+          onClick={onCurate}
+          disabled={
+            workflowRunning
+            || !curation?.enabled
+            || curation.ready_entities < 1
+          }
+        >
+          {curationRunning
+            ? <Loader2 size={14} className="spin" />
+            : <Sparkles size={14} />}
+          <span>{curationRunning ? "Curating" : "Curate descriptions"}</span>
+        </button>
+      </div>
+
+      {curationTask?.status === "succeeded" && (
+        <div className="task-status-line subtle">
+          <Activity size={14} />
+          <span className="task-copy">{curationResultCopy(curationTask)}</span>
+        </div>
+      )}
+
+      {curationTask?.status === "failed" && curationTask.error && (
+        <div className="task-status-line subtle">
+          <span className="error-text">{curationTask.error}</span>
         </div>
       )}
 
@@ -128,7 +199,7 @@ export function IngestControl({
         <button
           className={`command-button danger${clearState === "confirm" ? " confirm" : ""}`}
           onClick={handleClear}
-          disabled={clearState === "clearing" || running}
+          disabled={clearState === "clearing" || workflowRunning}
           onBlur={() => { if (clearState === "confirm") setClearState("idle"); }}
         >
           {clearState === "clearing"
@@ -141,4 +212,31 @@ export function IngestControl({
       </div>
     </section>
   );
+}
+
+function curationStatusCopy(curation?: CurationPending): string {
+  if (!curation) return "Checking descriptions…";
+  if (!curation.enabled) return "Description updates are disabled.";
+  if (curation.ready_entities > 0) {
+    return `${curation.ready_entities} ready to update; `
+      + `${curation.waiting_entities} waiting for more evidence.`;
+  }
+  if (curation.waiting_entities > 0) {
+    return `${curation.waiting_entities} waiting for more evidence.`;
+  }
+  return "No descriptions need updating.";
+}
+
+function curationResultCopy(task: TaskStatus): string {
+  const result = task.result;
+  const candidates = numberResult(result, "candidate_entities");
+  const updated = numberResult(result, "updated");
+  const kept = numberResult(result, "kept");
+  const cost = numberResult(result, "cost_usd");
+  return `${candidates} curated: ${updated} updated, ${kept} kept; $${cost.toFixed(4)} LLM cost.`;
+}
+
+function numberResult(result: Record<string, unknown> | undefined, key: string): number {
+  const value = result?.[key];
+  return typeof value === "number" ? value : 0;
 }

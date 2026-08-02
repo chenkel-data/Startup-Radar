@@ -14,6 +14,9 @@ const apiMock = vi.hoisted(() => ({
   search: vi.fn(),
   startIngest: vi.fn(),
   ingestStatus: vi.fn(),
+  curationPending: vi.fn(),
+  startCuration: vi.fn(),
+  curationStatus: vi.fn(),
   clearGraph: vi.fn(),
   entityCounts: vi.fn(),
   insights: vi.fn(),
@@ -132,6 +135,15 @@ describe("App graph exploration", () => {
       merged_node_ids: [],
     });
     vi.mocked(api.clearGraph).mockResolvedValue({ status: "ok", deleted_nodes: 0 });
+    vi.mocked(api.curationPending).mockResolvedValue({
+      enabled: true,
+      policy_hash: "policy-1",
+      threshold: 3,
+      ready_entities: 0,
+      waiting_entities: 0,
+      ready_evidence: 0,
+      waiting_evidence: 0,
+    });
     vi.mocked(api.entityCounts).mockResolvedValue({
       Startup: 0,
       Investor: 0,

@@ -166,10 +166,8 @@ class EntityProfileStore:
         """Return candidates for entity profile curation.
 
         When ``entity_ids`` is provided, candidates are limited to those resolved
-        entities. The evidence selection remains the same as the graph-wide
-        curation path: only profile evidence from articles that have not already
-        contributed to the current profile under the current curation policy is
-        surfaced as new evidence.
+        entities. Evidence is new only when its stable evidence ID has never been
+        considered and it was ingested under the active curation policy.
         """
         if entity_ids is not None and not entity_ids:
             return []
@@ -177,9 +175,10 @@ class EntityProfileStore:
         MATCH (n)
         WHERE any(label IN labels(n) WHERE label IN $entity_labels)
           AND ($entity_ids IS NULL OR n.id IN $entity_ids)
-        WITH n, coalesce(n.description_considered_article_policy_keys, []) AS considered_article_policy_keys
+          AND coalesce(n.description_source, "") <> "human"
+        WITH n, coalesce(n.description_considered_evidence_ids, []) AS considered_evidence_ids
         OPTIONAL MATCH (n)-[:HAS_PROFILE_EVIDENCE]->(evidence:ProfileEvidence)
-        WITH n, considered_article_policy_keys,
+        WITH n, considered_evidence_ids,
              collect(DISTINCT evidence) AS profile_evidence_nodes
         WITH n,
              [
@@ -187,9 +186,7 @@ class EntityProfileStore:
                WHERE evidence IS NOT NULL
                  AND evidence.kind = "entity_description"
                  AND coalesce(evidence.text, "") <> ""
-                 AND coalesce(evidence.article_id, "") <> ""
-                 AND coalesce(evidence.article_id, "") + "::" + $profile_curation_policy_hash
-                     IN considered_article_policy_keys
+                 AND evidence.id IN considered_evidence_ids
                | {
                  id: evidence.id,
                  article_id: evidence.article_id,
@@ -200,15 +197,12 @@ class EntityProfileStore:
                evidence IN profile_evidence_nodes
                WHERE coalesce(evidence.profile_candidate, false) = true
                  AND evidence.kind = "entity_description"
-                 AND coalesce(evidence.article_id, "") <> ""
-                 AND NOT (
-                   coalesce(evidence.article_id, "") + "::" + $profile_curation_policy_hash
-                       IN considered_article_policy_keys
-                 )
+                 AND coalesce(evidence.text, "") <> ""
+                 AND NOT evidence.id IN considered_evidence_ids
+                 AND $profile_curation_policy_hash
+                     IN coalesce(evidence.ingested_profile_curation_policy_hashes, [])
              ] AS new_evidence
         WHERE size(new_evidence) > 0
-           OR coalesce(n.description, "") = ""
-           OR n.embedding IS NULL
         RETURN n.id AS id,
                head([label IN labels(n) WHERE label IN $entity_labels]) AS label,
                n.name AS name,

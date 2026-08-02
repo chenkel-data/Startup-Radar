@@ -18,7 +18,7 @@ flowchart LR
   Parser --> Gate[Evidence gate]
   Gate --> Resolver[Entity resolution]
   Resolver --> Graph[(Neo4j)]
-  Graph --> DescriptionCheck[Optional review + curation step]
+  Graph --> DescriptionCheck[Manual review + curation job]
   DescriptionCheck --> Graph
   Graph --> API[FastAPI]
   API --> UI[React graph UI]
@@ -62,14 +62,20 @@ It writes relationship claims such as:
 Every persisted claim keeps evidence, source articles, lifecycle state, review
 state, and MLflow trace references.
 
-After entity resolution, an additional AI curation step can review resolved entity profiles. An entity profile is the source-backed description and related metadata (including evidence and traces) attached to the entity, such as a startup, investor, person, company, or topic
+Entity descriptions can be reviewed in a separate, manually started AI curation
+job. An entity profile is the source-backed description and related metadata
+(including evidence and traces) attached to a startup, investor, person,
+company, or topic.
 
 Profiles are revised as more evidence arrives. A profile created from one article
 may be incomplete, too closely reflect that article's angle, or become stale over
 time. The curation step compares new article evidence with the current profile
-and decides whether to keep it, update it, or flag it for human review. The
-backend records which evidence has already been considered for each entity, so
-unchanged policies (unchanged prompts for review and curation) do not trigger the same review again.
+and decides whether to keep it, update it, or flag it for human review. It runs
+only when explicitly started and an entity has at least three distinct new
+evidence texts. Evidence is permanently cached by its stable evidence ID after
+consideration, so the same evidence is not reviewed again. A curation policy
+hash also limits each job to evidence ingested under the active prompts and
+model settings.
 
 
 
@@ -96,11 +102,11 @@ prompt-only demo. It includes the surrounding system that makes LLM extraction a
 | Concern | Implementation |
 | --- | --- |
 | Real input | Async article discovery, fetching, and parsing |
-| Structured output | Delimiter-based extraction into Pydantic models |
+| Structured output | Strict JSON Schema extraction with article evidence references |
 | Evidence handling | `stated`, `attributed`, and `unsure` claim states |
 | Safety gate | Only admitted extracted facts become supported graph claims |
 | Entity resolution | Normalization, fuzzy matching, and optional embeddings |
-| Entity curation | Optional review of Entitie's Profile (update, keep, or flag)|
+| Entity curation | Manual batched review of entity profiles (update, keep, or flag) |
 | Provenance | Article URLs, evidence text, trace IDs, and trace links |
 | Human review | Accept, reject, or reset graph claims |
 | Observability | MLflow runs, traces, spans, prompts, artifacts, and feedback |
@@ -180,22 +186,21 @@ sequenceDiagram
     API->>MLflow: start process_article trace
     API->>LLM: extraction prompt
     LLM-->>MLflow: prompt, response, tokens
-    API->>Parser: parse delimiter rows
+    API->>Parser: validate strict JSON and evidence references
     Parser-->>MLflow: structured extraction output
     API->>API: evidence gate
     API->>Resolver: normalize and resolve entities
     Resolver-->>MLflow: exact/fuzzy/embedding outcomes
     API->>Neo4j: write nodes, claims, evidence, provenance
     Neo4j-->>MLflow: graph operation counts
-    opt description check enabled
-      API->>Descriptions: compare descriptions with new evidence
-      Descriptions-->>MLflow: description decision trace
-      Descriptions->>Neo4j: save description status and trace link
-    end
   end
 
   API->>MLflow: metrics and artifacts
   UI->>API: refresh graph and claims
+  UI->>API: manually start curation
+  API->>Descriptions: curate entities with at least 3 new evidence texts
+  Descriptions-->>MLflow: description decision traces and LLM costs
+  Descriptions->>Neo4j: save descriptions and considered evidence IDs
 ```
 
 ### Pipeline Stages
@@ -204,12 +209,12 @@ sequenceDiagram
 | --- | --- |
 | Scraping | Collect article links, fetch HTML, extract clean metadata and body text |
 | LLM extraction | Extract entities and relationships in a strict structured format |
-| Gleaning | Optional follow-up pass for missed or malformed records |
+| Gleaning | Optional recall-only pass for missed supported records |
 | Parsing | Convert raw model output into typed Pydantic records |
 | Evidence gate | Admit `stated` and `attributed`; quarantine `unsure` |
 | Entity resolution | Merge duplicates through exact, fuzzy, and embedding-based matching |
 | Graph write | Persist entities, claims, article support, and provenance |
-| Entity curation | Optionally review whether entity description should be updated |
+| Entity curation | Manually review batches with at least three distinct new evidence texts |
 | Human review | Mark conflicting or changed claims and allow human decisions |
 | Observability | Attach run metrics, trace spans, prompt versions, artifacts, and feedback |
 
@@ -297,8 +302,8 @@ flowchart LR
   Traces --> Gate[Evidence gate]
   Traces --> Resolve[Entity resolution]
   Traces --> Write[Neo4j write]
-  Traces --> Curation[Entity curation]
   Traces --> Feedback[Human feedback]
+  CurationJob[Manual curation task] --> CurationTraces[Profile review and rewrite traces]
 ```
 
 Run-level tracking includes source settings, model configuration, prompt URIs,
@@ -320,13 +325,12 @@ Article traces include:
 | `process_article` | Root trace for one article |
 | `extract_entities` | LLM orchestration and extraction audit |
 | `OpenAI chat span` | Prompt, response, tokens, model metadata |
-| `gleaning_pass` | Follow-up extraction corrections |
-| `parse_extraction_response` | Raw delimiter rows to typed output |
+| `gleaning_pass` | Recall-only audit for missed supported facts |
+| `parse_extraction_response` | Strict JSON records to evidence-validated typed output |
 | `evidence_gate` | Claims admitted or dropped |
 | `resolve_entities` | Batch entity resolution summary |
 | `resolve_entity` | Exact/fuzzy/embedding decision for one entity |
 | `write_to_neo4j` | Graph write operation count |
-| `curate_resolved_entity_profiles` | Starts optional entity profile curation |
 
 Run artifacts include:
 
@@ -336,7 +340,6 @@ Run artifacts include:
 | `extraction_summary.jsonl` | Per-article extraction counts |
 | `graph_ops.jsonl` | Per-article graph write results |
 | `extraction_dump.jsonl` | Structured extraction payloads |
-| `entity_description_curation.jsonl` | curation results per entity |
 | `llm_costs.jsonl` | Per-LLM-call token and cost rows by workflow step |
 | `failed_articles.jsonl` | Failed article URLs and errors |
 | `dedup_report.json` | Entity resolution outcomes |
@@ -396,7 +399,7 @@ Important environment variables:
 | `LLM_TIMEOUT_SECONDS` | Timeout per LLM request |
 | `LLM_RETRY_ATTEMPTS` | Application-level extraction retries |
 | `LLM_GLEANING_PASSES` | Additional extraction review passes |
-| `ENABLE_ENTITY_DESCRIPTION_CURATION` | Enables optional entity profile curation |
+| `ENABLE_ENTITY_DESCRIPTION_CURATION` | Enables manual profile curation and evidence policy stamping |
 | `ENTITY_CURATION_MAX_CONCURRENCY` | Maximum parallel profile reviews |
 | `EMBEDDING_PROVIDER` | `openai` or `sentence-transformers` |
 | `EMBEDDING_MODEL` | OpenAI embedding model |
@@ -410,7 +413,6 @@ Important environment variables:
 | `MLFLOW_PROMPT_PROFILE_REVIEW_URI` | Prompt Registry URI for profile review |
 | `MLFLOW_PROMPT_PROFILE_CURATION_URI` | Prompt Registry URI for writing updated descriptions |
 | `SCRAPE_TIMEOUT_SECONDS` | Per-request scraping timeout |
-| `MAX_ARTICLES_PER_INGEST` | Hard cap for one ingestion job |
 
 See [.env.example](./.env.example) for the full local configuration.
 
@@ -554,4 +556,7 @@ When an entity description looks wrong or stale:
 5. Inspect `review_entity_profile` for the keep, update, or flag decision.
 6. If the description changed, inspect `curate_entity_profile` for the new text.
 
-Profile curations are policy-aware. The same article is not reviewed again for the same entity unless the policy changes (the review or curation prompt).
+Profile curation is manual and policy-aware. Evidence must have been ingested
+under the active policy and an entity must have at least three distinct,
+not-yet-considered evidence texts. Once an evidence ID has been considered, it
+is not reviewed again, including after a policy change.
