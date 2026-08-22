@@ -1,5 +1,15 @@
 # Startup Radar
 
+[![CI](https://github.com/chenkel-data/Startup-Radar/actions/workflows/ci.yml/badge.svg)](https://github.com/chenkel-data/Startup-Radar/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](backend/pyproject.toml)
+[![TypeScript 5.7](https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white)](frontend/package.json)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React 18](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Neo4j 5.26](https://img.shields.io/badge/Neo4j-5.26-4581C3?logo=neo4j&logoColor=white)](https://neo4j.com/)
+[![MLflow 3](https://img.shields.io/badge/MLflow-3-0194E2?logo=mlflow&logoColor=white)](https://mlflow.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Read on Medium](https://img.shields.io/badge/Read_on-Medium-000000?logo=medium&logoColor=white)](https://medium.com/@christopher.henkel.ai/from-llm-output-to-reliable-knowledge-building-startup-radar-1e1256fd8ca9)
+
 Startup Radar turns startup news into an evidence-backed knowledge graph with end-to-end LLM observability.
 
 It scrapes startup news articles ([deutsche-startups.de](https://www.deutsche-startups.de),
